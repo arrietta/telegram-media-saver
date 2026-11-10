@@ -168,7 +168,8 @@ def run_webhook(bot: Bot) -> None:
     app.router.add_get("/", health)
     SimpleRequestHandler(dp, bot, secret_token=WEBHOOK_SECRET).register(app, path=WEBHOOK_PATH)
     setup_application(app, dp, bot=bot)
-    web.run_app(app, host="0.0.0.0", port=PORT)
+    # access_log=None: иначе проверки здоровья каждые 5 секунд забивают весь лог.
+    web.run_app(app, host="0.0.0.0", port=PORT, access_log=None)
 
 
 def main() -> None:

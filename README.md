@@ -38,8 +38,8 @@ cp .env.example .env   # впиши BOT_TOKEN
   обрабатывается с задержкой около минуты, пока сервис просыпается.
 - **YouTube и Instagram часто блокируют серверные IP** («Sign in to confirm you're not a bot»,
   «login required»). Лечится файлом cookies: экспортируй `cookies.txt` (формат Netscape)
-  из браузера, где ты залогинен, добавь его в Render как **Secret File** с именем `cookies.txt`
-  и задай переменную `COOKIES_FILE=/etc/secrets/cookies.txt`. Лучше использовать запасной аккаунт.
+  из браузера, где ты залогинен, и добавь его в Render как **Secret File** с именем `cookies.txt`
+  (Environment → Secret Files) — бот найдёт его сам. Лучше использовать запасной аккаунт.
   TikTok обычно работает без этого.
 - yt-dlp нужно периодически обновлять — сайты меняются. На Render для этого достаточно
   **Manual Deploy → Clear build cache & deploy**.

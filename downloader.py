@@ -45,8 +45,10 @@ def find_urls(text: str) -> list[str]:
 def _prepare_cookies() -> str | None:
     """yt-dlp перезаписывает файл cookies, а секретные файлы на хостинге
     доступны только для чтения — поэтому работаем с копией."""
-    src = os.getenv("COOKIES_FILE")
-    if not src or not Path(src).is_file():
+    # /etc/secrets/cookies.txt — сюда Render кладёт Secret File с именем cookies.txt.
+    candidates = [os.getenv("COOKIES_FILE"), "/etc/secrets/cookies.txt", "cookies.txt"]
+    src = next((c for c in candidates if c and Path(c).is_file()), None)
+    if not src:
         return None
     dst = Path(tempfile.gettempdir()) / "tms_cookies.txt"
     shutil.copyfile(src, dst)
@@ -143,6 +145,10 @@ def _download_sync(url: str, out: Path) -> list[Path]:
     # Посты Instagram и фото-посты TikTok — это часто картинки, с ними лучше
     # справляется gallery-dl; для всего остального сначала пробуем yt-dlp.
     steps = [_gallery, _ytdlp] if PHOTO_FIRST_RE.search(url) else [_ytdlp, _gallery]
+    is_instagram = "instagram.com" in url.lower()
+    if is_instagram and not COOKIES:
+        # Без входа gallery-dl с Instagram не работает вообще — не тратим на него время.
+        steps = [_ytdlp]
     errors: list[str] = []
     for step in steps:
         _clear(out)
@@ -156,7 +162,10 @@ def _download_sync(url: str, out: Path) -> list[Path]:
             return files
     # Показываем ошибку yt-dlp — она обычно самая понятная.
     main = errors[steps.index(_ytdlp)] if len(errors) == len(steps) else None
-    raise DownloadError(main or (errors[0] if errors else "по ссылке не нашлось медиа"))
+    text = main or (errors[0] if errors else "по ссылке не нашлось медиа")
+    if is_instagram and not COOKIES:
+        text = f"Instagram не отдаёт это серверу без входа в аккаунт (нужен cookies.txt). {text}"
+    raise DownloadError(text)
 
 
 async def download(url: str, out: Path) -> list[Path]:
