@@ -2,14 +2,18 @@
 
 import asyncio
 import copy
+import json
 import os
 import re
 import shutil
+import ssl
 import subprocess
 import sys
 import tempfile
+import urllib.request
 from pathlib import Path
 
+import certifi
 import yt_dlp
 
 # Bot API не принимает файлы больше 50 МБ — оставляем небольшой запас.
@@ -22,7 +26,14 @@ URL_RE = re.compile(
     re.IGNORECASE,
 )
 PHOTO_FIRST_RE = re.compile(r"instagram\.com/p/|tiktok\.com/.+/photo/", re.IGNORECASE)
+YT_POST_RE = re.compile(r"youtube\.com/post/", re.IGNORECASE)
 ANSI_RE = re.compile(r"\x1b\[[0-9;]*m")
+# Сертификаты из certifi: у Python на macOS своих корневых сертификатов нет.
+SSL_CONTEXT = ssl.create_default_context(cafile=certifi.where())
+BROWSER_UA = (
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/130.0 Safari/537.36"
+)
 
 VIDEO_EXT = {".mp4", ".mov", ".m4v", ".webm", ".mkv"}
 PHOTO_EXT = {".jpg", ".jpeg", ".png", ".webp"}
@@ -141,7 +152,61 @@ def _gallery(url: str, out: Path) -> None:
         raise DownloadError(_clean(lines[-1] if lines else "gallery-dl ничего не нашёл"))
 
 
+def _fetch(url: str) -> tuple[bytes, str]:
+    req = urllib.request.Request(
+        url, headers={"User-Agent": BROWSER_UA, "Accept-Language": "en", "Cookie": "SOCS=CAI"}
+    )
+    with urllib.request.urlopen(req, timeout=30, context=SSL_CONTEXT) as resp:
+        return resp.read(), resp.headers.get_content_type()
+
+
+def _find_key(node: object, key: str):
+    if isinstance(node, dict):
+        for k, v in node.items():
+            if k == key:
+                yield v
+            yield from _find_key(v, key)
+    elif isinstance(node, list):
+        for v in node:
+            yield from _find_key(v, key)
+
+
+def _youtube_post(url: str, out: Path) -> None:
+    """Посты из вкладки «Сообщество»: yt-dlp и gallery-dl их не умеют,
+    поэтому достаём картинки прямо из данных страницы."""
+    page, _ = _fetch(url.replace("//m.youtube.com", "//www.youtube.com"))
+    match = re.search(rb"var ytInitialData\s*=\s*(\{.*?\});\s*</script>", page, re.DOTALL)
+    post = next(_find_key(json.loads(match.group(1)), "backstagePostRenderer"), None) if match else None
+    if post is None:
+        raise DownloadError("не удалось прочитать пост YouTube")
+    attachment = post.get("backstageAttachment") or {}
+
+    video_id = next(_find_key(attachment, "videoId"), None)
+    if video_id:
+        _ytdlp(f"https://www.youtube.com/watch?v={video_id}", out)
+        return
+
+    images = list(_find_key(attachment, "backstageImageRenderer"))[:MAX_ITEMS]
+    if not images:
+        raise DownloadError("в этом посте нет картинок и видео — только текст")
+    types = {"image/jpeg": ".jpg", "image/png": ".png", "image/webp": ".webp", "image/gif": ".gif"}
+    for i, image in enumerate(images, 1):
+        thumb = image["image"]["thumbnails"][-1]["url"]
+        # «=s0» вместо параметров превью отдаёт оригинал без обрезки под квадрат.
+        data, ctype = _fetch(thumb.split("=")[0] + "=s0")
+        (out / f"{i:02d}{types.get(ctype, '.jpg')}").write_bytes(data)
+
+
 def _download_sync(url: str, out: Path) -> list[Path]:
+    if YT_POST_RE.search(url):
+        try:
+            _youtube_post(url, out)
+        except DownloadError:
+            raise
+        except Exception as e:  # noqa: BLE001
+            raise DownloadError(_clean(e)) from None
+        return _files(out)
+
     # Посты Instagram и фото-посты TikTok — это часто картинки, с ними лучше
     # справляется gallery-dl; для всего остального сначала пробуем yt-dlp.
     steps = [_gallery, _ytdlp] if PHOTO_FIRST_RE.search(url) else [_ytdlp, _gallery]
