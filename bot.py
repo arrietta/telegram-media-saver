@@ -46,6 +46,7 @@ PORT = int(os.getenv("PORT", "8080"))
 MAX_PHOTO_BYTES = 10 * 1024 * 1024  # лимит Telegram на фото
 MAX_URLS_PER_MESSAGE = 3
 UPLOAD_TIMEOUT = 300
+DOWNLOAD_TIMEOUT = 240
 
 dp = Dispatcher()
 # На бесплатном тарифе мало памяти и CPU — не качаем больше двух ссылок сразу.
@@ -73,13 +74,20 @@ async def on_message(message: Message) -> None:
 
 
 async def handle_url(message: Message, url: str) -> None:
+    log.info("got link %s", url)
     status = await message.reply("⏳ Скачиваю…")
     tmp = Path(tempfile.mkdtemp(prefix="tms_"))
     try:
         async with downloads:
-            files = await download(url, tmp)
+            files = await asyncio.wait_for(download(url, tmp), DOWNLOAD_TIMEOUT)
+        log.info("downloaded %d file(s) for %s", len(files), url)
+        with contextlib.suppress(Exception):
+            await status.edit_text("📤 Отправляю…")
         async with ChatActionSender.upload_video(bot=message.bot, chat_id=message.chat.id):
             await send_files(message, files)
+    except TimeoutError:
+        log.warning("download timed out for %s", url)
+        await message.reply("❌ Не успел скачать за 4 минуты — сайт отвечает слишком медленно.")
     except DownloadError as e:
         log.warning("download failed for %s: %s", url, e)
         await message.reply(f"❌ Не получилось скачать: {e}")

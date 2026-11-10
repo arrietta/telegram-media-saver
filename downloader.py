@@ -1,6 +1,7 @@
 """Скачивание медиа по ссылке: yt-dlp для видео, gallery-dl для фото и каруселей."""
 
 import asyncio
+import copy
 import os
 import re
 import shutil
@@ -88,8 +89,9 @@ def _ytdlp_opts(out: Path, height: int) -> dict:
         "quiet": True,
         "no_warnings": True,
         "noprogress": True,
-        "socket_timeout": 30,
-        "retries": 3,
+        "socket_timeout": 20,
+        "retries": 2,
+        "extractor_retries": 1,
     }
     if COOKIES:
         opts["cookiefile"] = COOKIES
@@ -97,8 +99,11 @@ def _ytdlp_opts(out: Path, height: int) -> dict:
 
 
 def _ytdlp(url: str, out: Path) -> None:
-    with yt_dlp.YoutubeDL({**_ytdlp_opts(out, 720), "skip_download": True}) as ydl:
-        info = ydl.extract_info(url, download=False) or {}
+    with yt_dlp.YoutubeDL(_ytdlp_opts(out, 720)) as ydl:
+        info = ydl.sanitize_info(ydl.extract_info(url, download=False) or {})
+    # Разбор страницы — самая медленная часть на слабом сервере, поэтому для
+    # одиночного видео делаем его один раз и дальше качаем по готовым данным.
+    single = info.get("_type", "video") == "video" and bool(info.get("formats"))
     if info.get("is_live"):
         raise DownloadError("это прямой эфир, его скачать нельзя")
     if (info.get("duration") or 0) > MAX_DURATION:
@@ -109,18 +114,24 @@ def _ytdlp(url: str, out: Path) -> None:
     for height in (720, 480, 360) if is_youtube else (1080,):
         _clear(out)
         with yt_dlp.YoutubeDL(_ytdlp_opts(out, height)) as ydl:
-            ydl.download([url])
+            if single:
+                ydl.process_ie_result(copy.deepcopy(info), download=True)
+            else:
+                ydl.download([url])
         files = _files(out)
         if files and max(f.stat().st_size for f in files) <= MAX_BYTES:
             return
 
 
 def _gallery(url: str, out: Path) -> None:
+    # Без повторов и с коротким таймаутом: если сайт требует вход, gallery-dl
+    # должен сдаться быстро, а не держать пользователя минутами.
     cmd = [sys.executable, "-m", "gallery_dl", "-D", str(out), "--range", f"1-{MAX_ITEMS}"]
+    cmd += ["--retries", "0", "--http-timeout", "15"]
     if COOKIES:
         cmd += ["--cookies", COOKIES]
     try:
-        proc = subprocess.run(cmd + [url], capture_output=True, text=True, timeout=180)
+        proc = subprocess.run(cmd + [url], capture_output=True, text=True, timeout=60)
     except subprocess.TimeoutExpired:
         raise DownloadError("скачивание заняло слишком много времени") from None
     if proc.returncode != 0 and not _files(out):
