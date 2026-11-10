@@ -1,0 +1,9 @@
+services:
+  - type: web
+    name: telegram-media-saver
+    runtime: docker
+    plan: free
+    healthCheckPath: /
+    envVars:
+      - key: BOT_TOKEN
+        sync: false
