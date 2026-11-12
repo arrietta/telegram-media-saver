@@ -4,8 +4,9 @@
 с названием ролика в подписи. Разбирает и качает yt-dlp, видео со звуком
 склеивает ffmpeg без перекодирования.
 
-На хостинге YouTube требует вход («Sign in to confirm you're not a bot») —
-там нужен файл cookies.txt, см. README.
+На хостинге YouTube не пускает адрес сервера («Sign in to confirm you're not
+a bot»), поэтому сначала идём через Cloudflare WARP (см. warp.py), а если он
+не поднялся или не помог — напрямую, с файлом cookies.txt, если он есть.
 """
 
 import copy
@@ -15,6 +16,7 @@ from pathlib import Path
 
 import yt_dlp
 
+import warp
 from common import COOKIES, HAS_FFMPEG, MAX_BYTES, DownloadError, Media
 
 log = logging.getLogger("youtube")
@@ -32,7 +34,7 @@ def browser_link(url: str) -> str | None:
     return f"https://ssyoutube.com/watch?v={match.group(1)}" if match else None
 
 
-def _opts(out: Path, quality: int, vertical: bool) -> dict:
+def _opts(out: Path, quality: int, vertical: bool, proxy: str | None) -> dict:
     # У вертикальных Shorts «720p» — это ширина, поэтому меряем по короткой стороне.
     side = f"[{'width' if vertical else 'height'}<={quality}]"
     opts = {
@@ -50,7 +52,10 @@ def _opts(out: Path, quality: int, vertical: bool) -> dict:
         "retries": 2,
         "extractor_retries": 1,
     }
-    if COOKIES:
+    if proxy:
+        opts["proxy"] = proxy
+    elif COOKIES:
+        # Cookies привязаны к обычному входу — через чужой адрес WARP их не шлём.
         opts["cookiefile"] = COOKIES
     return opts
 
@@ -70,7 +75,7 @@ def _pick(info: dict, quality: int, vertical: bool) -> dict | None:
     """Что yt-dlp выберет при таком потолке качества: настоящее качество и вес
     (None — неизвестен). Сеть не трогает, считает по уже полученным данным."""
     try:
-        with yt_dlp.YoutubeDL(_opts(Path("."), quality, vertical)) as ydl:
+        with yt_dlp.YoutubeDL(_opts(Path("."), quality, vertical, None)) as ydl:
             res = ydl.process_ie_result(copy.deepcopy(info), download=False)
     except Exception:  # noqa: BLE001 — такого качества у ролика нет
         return None
@@ -110,8 +115,21 @@ def _choices(info: dict) -> list[dict]:
 
 
 def download(url: str, out: Path) -> Media:
+    # Сначала через WARP, потом напрямую. Ошибку показываем от последней попытки.
+    routes = [p for p in (warp.proxy(),) if p] + [None]
+    for proxy in routes:
+        try:
+            return _download(url, out, proxy)
+        except DownloadError as e:
+            if proxy is None or not e.retry:
+                raise
+            log.info("youtube via WARP failed (%s), trying directly", e)
+    raise AssertionError("unreachable")
+
+
+def _download(url: str, out: Path, proxy: str | None) -> Media:
     try:
-        with yt_dlp.YoutubeDL(_opts(out, QUALITIES[0], False)) as ydl:
+        with yt_dlp.YoutubeDL(_opts(out, QUALITIES[0], False, proxy)) as ydl:
             info = ydl.sanitize_info(ydl.extract_info(url, download=False) or {})
         if info.get("_type", "video") != "video" or not info.get("formats"):
             raise DownloadError("пришли ссылку на само видео, а не на плейлист или канал")
@@ -122,8 +140,10 @@ def download(url: str, out: Path) -> Media:
         for choice in _choices(info):
             for old in out.iterdir():
                 old.unlink()
-            log.info("youtube %s: trying %dp", info.get("id"), choice["quality"])
-            with yt_dlp.YoutubeDL(_opts(out, choice["limit"], choice["vertical"])) as ydl:
+            log.info(
+                "youtube %s: %dp via %s", info.get("id"), choice["quality"], "WARP" if proxy else "direct"
+            )
+            with yt_dlp.YoutubeDL(_opts(out, choice["limit"], choice["vertical"], proxy)) as ydl:
                 ydl.process_ie_result(copy.deepcopy(info), download=True)
             files = [p for p in out.iterdir() if p.suffix.lower() in (".mp4", ".webm", ".mkv")]
             if files and files[0].stat().st_size <= MAX_BYTES:
@@ -138,4 +158,8 @@ def download(url: str, out: Path) -> Media:
     except DownloadError:
         raise
     except Exception as e:  # noqa: BLE001
-        raise DownloadError(_explain(e)) from None
+        # Сбой самого yt-dlp (отказ YouTube, обрыв связи) — есть смысл попробовать
+        # другой маршрут; наши собственные отказы от маршрута не зависят.
+        error = DownloadError(_explain(e))
+        error.retry = True
+        raise error from None

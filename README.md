@@ -46,5 +46,9 @@ cp .env.example .env   # впиши BOT_TOKEN
   из браузера, где ты залогинен, и добавь его в Render как **Secret File** с именем `cookies.txt`
   (Environment → Secret Files) — бот найдёт его сам. Лучше использовать запасной аккаунт.
   TikTok обычно работает без этого.
+- **YouTube через Cloudflare WARP (эксперимент).** При запуске бот пробует поднять бесплатный
+  туннель WARP (`warp.py`) и ходит на YouTube через него — с адреса Cloudflare, а не хостинга.
+  В логах при старте будет строка `WARP is ready` или `WARP is off: причина`. Если туннель
+  не поднялся или YouTube отказал и ему, бот пробует напрямую с `cookies.txt`.
 - yt-dlp нужно периодически обновлять — сайты меняются. На Render для этого достаточно
   **Manual Deploy → Clear build cache & deploy**.

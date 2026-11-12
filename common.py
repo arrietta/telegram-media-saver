@@ -39,6 +39,8 @@ COOKIES = _prepare_cookies()
 class DownloadError(Exception):
     """Ошибка с текстом, который можно показать пользователю."""
 
+    retry = False  # True — сбой маршрута, есть смысл попробовать другой
+
 
 @dataclass
 class Media:

@@ -30,6 +30,7 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
+import warp  # noqa: E402
 from common import MAX_BYTES, DownloadError, Media  # noqa: E402 — после load_dotenv,
 from downloader import (  # noqa: E402 — чтобы модули увидели переменные из .env
     AUDIO_EXT,
@@ -200,6 +201,7 @@ def run_webhook(bot: Bot) -> None:
 def main() -> None:
     if not BOT_TOKEN:
         raise SystemExit("Не задан BOT_TOKEN (см. .env.example)")
+    warp.start_in_background()
     bot = Bot(BOT_TOKEN)
     if WEBHOOK_BASE:
         run_webhook(bot)
