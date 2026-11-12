@@ -1,6 +1,7 @@
 """Скачивание медиа по ссылке: yt-dlp для видео, gallery-dl для фото и каруселей."""
 
 import asyncio
+import contextlib
 import copy
 import json
 import os
@@ -11,6 +12,7 @@ import subprocess
 import sys
 import tempfile
 import time
+import urllib.parse
 import urllib.request
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -331,6 +333,46 @@ def _fetch(url: str) -> tuple[bytes, str]:
         return resp.read(), resp.headers.get_content_type()
 
 
+def _save(url: str, path: Path) -> Path:
+    """Качает файл на диск по частям и подбирает расширение по типу содержимого."""
+    types = {"image/jpeg": ".jpg", "image/png": ".png", "image/webp": ".webp"}
+    req = urllib.request.Request(url, headers={"User-Agent": BROWSER_UA})
+    with urllib.request.urlopen(req, timeout=30, context=SSL_CONTEXT) as resp:
+        path = path.with_suffix(types.get(resp.headers.get_content_type(), path.suffix))
+        with path.open("wb") as f:
+            shutil.copyfileobj(resp, f)
+    return path
+
+
+def _tikwm(url: str, out: Path) -> None:
+    """Запасной путь для TikTok: когда он блокирует IP сервера, медиа достаёт
+    сторонний сервис tikwm.com (ключ не нужен)."""
+    root = "https://www.tikwm.com"
+    query = urllib.parse.urlencode({"url": url, "hd": 1})
+    reply = json.loads(_fetch(f"{root}/api/?{query}")[0])
+    if str(reply.get("code")) != "0" or not reply.get("data"):
+        raise DownloadError(f"tikwm: {reply.get('msg') or 'нет данных'}")
+    data = reply["data"]
+
+    def full(link: str) -> str:
+        return urllib.parse.urljoin(root, link)
+
+    images = (data.get("images") or [])[: TIKTOK_MAX_ITEMS - 1]
+    if images:
+        for i, image in enumerate(images, 1):
+            _save(full(image), out / f"{i:02d}.jpg")
+        if data.get("music"):
+            with contextlib.suppress(Exception):  # фото важнее музыки
+                _save(full(data["music"]), out / f"{len(images) + 1:02d}.mp3")
+        return
+    # HD-версия без водяного знака, если влезает в лимит Telegram.
+    hd_fits = data.get("hdplay") and int(data.get("hd_size") or 0) <= MAX_BYTES
+    video = data.get("hdplay") if hd_fits else data.get("play")
+    if not video:
+        raise DownloadError("tikwm: в ответе нет видео")
+    _save(full(video), out / f"01_{data.get('id', 'tiktok')}.mp4")
+
+
 def _find_key(node: object, key: str):
     if isinstance(node, dict):
         for k, v in node.items():
@@ -385,6 +427,8 @@ def _download_sync(url: str, out: Path) -> list[Path]:
     # Посты Instagram и фото-посты TikTok — это часто картинки, с ними лучше
     # справляется gallery-dl; для всего остального сначала пробуем yt-dlp.
     steps = [_gallery, _ytdlp] if PHOTO_FIRST_RE.search(url) else [_ytdlp, _gallery]
+    if is_tiktok:
+        steps.append(_tikwm)
     is_instagram = "instagram.com" in url.lower()
     if is_instagram and not COOKIES:
         # Без входа gallery-dl с Instagram не работает вообще — не тратим на него время.
