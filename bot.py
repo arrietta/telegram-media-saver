@@ -15,7 +15,15 @@ from pathlib import Path
 
 from aiogram import Bot, Dispatcher, F
 from aiogram.filters import CommandStart
-from aiogram.types import FSInputFile, InputMediaPhoto, InputMediaVideo, Message
+from aiogram.types import (
+    CallbackQuery,
+    FSInputFile,
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
+    InputMediaPhoto,
+    InputMediaVideo,
+    Message,
+)
 from aiogram.utils.chat_action import ChatActionSender
 from aiogram.webhook.aiohttp_server import SimpleRequestHandler, setup_application
 from aiohttp import web
@@ -29,8 +37,12 @@ from downloader import (  # noqa: E402 — после load_dotenv, чтобы у
     PHOTO_EXT,
     VIDEO_EXT,
     DownloadError,
+    YoutubeMenu,
     download,
     find_urls,
+    is_youtube_video,
+    youtube_download,
+    youtube_menu,
 )
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
@@ -78,6 +90,12 @@ async def handle_url(message: Message, url: str) -> None:
     status = await message.reply("⏳ Скачиваю…")
     tmp = Path(tempfile.mkdtemp(prefix="tms_"))
     try:
+        if is_youtube_video(url):
+            async with downloads:
+                menu = await asyncio.wait_for(youtube_menu(url), DOWNLOAD_TIMEOUT)
+            if menu:
+                await message.reply(menu_text(menu), reply_markup=menu_keyboard(menu))
+                return
         async with downloads:
             files = await asyncio.wait_for(download(url, tmp), DOWNLOAD_TIMEOUT)
         log.info("downloaded %d file(s) for %s", len(files), url)
@@ -100,7 +118,62 @@ async def handle_url(message: Message, url: str) -> None:
             await status.delete()
 
 
-async def send_files(message: Message, files: list[Path]) -> None:
+def menu_text(menu: YoutubeMenu) -> str:
+    minutes, seconds = divmod(menu.duration, 60)
+    hours, minutes = divmod(minutes, 60)
+    length = f"{hours}:{minutes:02d}:{seconds:02d}" if hours else f"{minutes}:{seconds:02d}"
+    text = f"🎬 {menu.title[:200]}\n⏱ {length}\n\nВыбери качество:"
+    if menu.hidden:
+        text += "\n(качество выше не влезает в лимит Telegram — 50 МБ)"
+    return text
+
+
+def menu_keyboard(menu: YoutubeMenu) -> InlineKeyboardMarkup:
+    buttons = [
+        InlineKeyboardButton(text=label, callback_data=f"yt:{menu.video_id}:{key}")
+        for key, label in menu.options
+    ]
+    rows = [buttons[i : i + 2] for i in range(0, len(buttons), 2)]
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+@dp.callback_query(F.data.startswith("yt:"))
+async def on_quality(callback: CallbackQuery) -> None:
+    _, video_id, choice = callback.data.split(":", 2)
+    menu = callback.message
+    await callback.answer()
+    if not isinstance(menu, Message):  # сообщение слишком старое
+        return
+    label = "аудио" if choice == "audio" else f"{choice}p"
+    # Убираем кнопки сразу, чтобы второе нажатие не запустило вторую загрузку.
+    with contextlib.suppress(Exception):
+        await menu.edit_text(f"⏳ Скачиваю {label}…")
+    target = menu.reply_to_message or menu  # отвечаем на сообщение со ссылкой
+    tmp = Path(tempfile.mkdtemp(prefix="tms_"))
+    try:
+        async with downloads:
+            files, title = await asyncio.wait_for(
+                youtube_download(video_id, choice, tmp), DOWNLOAD_TIMEOUT
+            )
+        with contextlib.suppress(Exception):
+            await menu.edit_text("📤 Отправляю…")
+        async with ChatActionSender.upload_video(bot=menu.bot, chat_id=menu.chat.id):
+            await send_files(target, files, title=title)
+    except TimeoutError:
+        await target.reply("❌ Не успел скачать за 4 минуты — сайт отвечает слишком медленно.")
+    except DownloadError as e:
+        log.warning("youtube download failed for %s (%s): %s", video_id, choice, e)
+        await target.reply(f"❌ Не получилось скачать: {e}")
+    except Exception:
+        log.exception("unexpected error for %s (%s)", video_id, choice)
+        await target.reply("❌ Что-то пошло не так, попробуй ещё раз позже.")
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+        with contextlib.suppress(Exception):
+            await menu.delete()
+
+
+async def send_files(message: Message, files: list[Path], title: str | None = None) -> None:
     album: list[Path] = []  # фото и видео — уходят одним альбомом
     audio: list[Path] = []
     documents: list[Path] = []
@@ -130,7 +203,7 @@ async def send_files(message: Message, files: list[Path]) -> None:
             ]
             await message.reply_media_group(media, request_timeout=UPLOAD_TIMEOUT)
     for f in audio:
-        await message.reply_audio(FSInputFile(f), request_timeout=UPLOAD_TIMEOUT)
+        await message.reply_audio(FSInputFile(f), title=title, request_timeout=UPLOAD_TIMEOUT)
     for f in documents:
         await message.reply_document(FSInputFile(f), request_timeout=UPLOAD_TIMEOUT)
 
