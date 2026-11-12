@@ -11,6 +11,8 @@ import ssl
 import subprocess
 import sys
 import tempfile
+import logging
+import urllib.error
 import urllib.parse
 import urllib.request
 from pathlib import Path
@@ -52,6 +54,9 @@ PHOTO_EXT = {".jpg", ".jpeg", ".png", ".webp"}
 AUDIO_EXT = {".mp3", ".m4a", ".ogg", ".opus", ".aac", ".wav"}
 
 
+log = logging.getLogger("downloader")
+
+
 class DownloadError(Exception):
     """Ошибка с текстом, который можно показать пользователю."""
 
@@ -86,9 +91,8 @@ def _clean(error: object) -> str:
     text = ANSI_RE.sub("", str(error)).replace("ERROR: ", "").strip()
     if "confirm you" in text and "not a bot" in text:
         return (
-            "YouTube не отдаёт видео серверу без входа в аккаунт. Владельцу бота нужно "
-            "добавить на хостинг файл cookies.txt (см. README)"
-            + (" — текущий файл устарел, его надо обновить." if COOKIES else ".")
+            "YouTube не пустил сервер, а переменная RAPIDAPI_KEY на хостинге не задана — "
+            "бот её не видит. Проверь имя переменной в Render и перезапусти сервис."
         )
     return text[:300] or "неизвестная ошибка"
 
@@ -139,17 +143,22 @@ def _extract(url: str) -> dict:
             return ydl.sanitize_info(ydl.extract_info(url, download=False) or {})
     except Exception:
         # YouTube часто не пускает серверные IP — тогда спрашиваем сторонний API.
-        video_id = YT_ID_RE.search(url) if RAPIDAPI_KEY and is_youtube_video(url) else None
+        video_id = YT_ID_RE.search(url) if is_youtube_video(url) else None
         if not video_id:
+            raise
+        if not RAPIDAPI_KEY:
+            log.warning("YouTube refused %s and RAPIDAPI_KEY is not set", url)
             raise
         try:
             return _rapidapi_info(video_id.group(1))
-        except Exception:  # noqa: BLE001 — запасной путь не помог, покажем исходную ошибку
-            pass
-        raise
+        except Exception as e:  # noqa: BLE001
+            log.warning("RapidAPI fallback failed for %s: %s", url, e)
+            raise DownloadError(
+                f"YouTube не пустил сервер, а запасной путь через RapidAPI не сработал: {_clean(e)}"
+            ) from None
 
 
-RAPIDAPI_KEY = os.getenv("RAPIDAPI_KEY")
+RAPIDAPI_KEY = (os.getenv("RAPIDAPI_KEY") or "").strip()
 RAPIDAPI_HOST = "youtube-media-downloader.p.rapidapi.com"
 
 
@@ -158,10 +167,14 @@ def _rapidapi_info(video_id: str) -> dict:
     виде, что отдаёт yt-dlp, чтобы дальше работал обычный код (меню, склейка)."""
     req = urllib.request.Request(
         f"https://{RAPIDAPI_HOST}/v2/video/details?videoId={video_id}&urlAccess=normal",
-        headers={"X-RapidAPI-Key": RAPIDAPI_KEY or "", "X-RapidAPI-Host": RAPIDAPI_HOST},
+        headers={"X-RapidAPI-Key": RAPIDAPI_KEY, "X-RapidAPI-Host": RAPIDAPI_HOST},
     )
-    with urllib.request.urlopen(req, timeout=30, context=SSL_CONTEXT) as resp:
-        data = json.loads(resp.read())
+    try:
+        with urllib.request.urlopen(req, timeout=30, context=SSL_CONTEXT) as resp:
+            data = json.loads(resp.read())
+    except urllib.error.HTTPError as e:
+        # В теле ответа RapidAPI пишет причину: неверный ключ, нет подписки, кончилась квота.
+        raise DownloadError(f"HTTP {e.code}: {e.read(200).decode(errors='replace')}") from None
     if data.get("errorId") != "Success":
         raise DownloadError(f"RapidAPI: {data.get('errorId') or data.get('message')}")
     duration = int(data.get("lengthSeconds") or 0)
@@ -189,8 +202,10 @@ def _rapidapi_info(video_id: str) -> dict:
             fmt["vcodec"] = codecs[0]
             fmt["acodec"] = (codecs[1] if len(codecs) > 1 else "aac") if item.get("hasAudio") else "none"
             # API отдаёт числа строками, а yt-dlp сравнивает высоту как число.
-            fmt["height"] = int(item.get("height") or 0) or None
-            fmt["width"] = int(item.get("width") or 0) or None
+            # У вертикальных Shorts «720p» — это ширина, а высота 1280. Качество
+            # считаем по короткой стороне, иначе Shorts всегда выходили бы в 360p.
+            sides = [int(item.get(k) or 0) for k in ("width", "height")]
+            fmt["height"], fmt["width"] = (min(sides) or None), (max(sides) or None)
         else:
             fmt["vcodec"], fmt["acodec"] = "none", codecs[0]
         formats.append(fmt)
