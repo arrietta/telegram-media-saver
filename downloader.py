@@ -283,6 +283,16 @@ def _youtube_download_sync(video_id: str, choice: str, out: Path) -> tuple[list[
     return files, info.get("title") or ""
 
 
+YT_ID_RE = re.compile(r"(?:[?&]v=|youtu\.be/|/shorts/|/embed/|/live/)([\w-]{11})")
+
+
+def ssyoutube_link(url: str) -> str | None:
+    """Ссылка на тот же ролик на ssyoutube.com — там его можно скачать в браузере,
+    когда бот не может (YouTube требует вход или файл больше 50 МБ)."""
+    match = YT_ID_RE.search(url) if is_youtube_video(url) else None
+    return f"https://ssyoutube.com/watch?v={match.group(1)}" if match else None
+
+
 def is_youtube_video(url: str) -> bool:
     """Ссылки YouTube, для которых стоит показать меню качества."""
     return bool(YT_RE.match(url)) and not YT_POST_RE.search(url)

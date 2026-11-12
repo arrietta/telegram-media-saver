@@ -41,6 +41,7 @@ from downloader import (  # noqa: E402 — после load_dotenv, чтобы у
     download,
     find_urls,
     is_youtube_video,
+    ssyoutube_link,
     youtube_download,
     youtube_menu,
 )
@@ -108,7 +109,7 @@ async def handle_url(message: Message, url: str) -> None:
         await message.reply("❌ Не успел скачать за 4 минуты — сайт отвечает слишком медленно.")
     except DownloadError as e:
         log.warning("download failed for %s: %s", url, e)
-        await message.reply(f"❌ Не получилось скачать: {e}")
+        await message.reply(f"❌ Не получилось скачать: {e}", reply_markup=browser_keyboard(url))
     except Exception:
         log.exception("unexpected error for %s", url)
         await message.reply("❌ Что-то пошло не так, попробуй ещё раз позже.")
@@ -124,7 +125,7 @@ def menu_text(menu: YoutubeMenu) -> str:
     length = f"{hours}:{minutes:02d}:{seconds:02d}" if hours else f"{minutes}:{seconds:02d}"
     text = f"🎬 {menu.title[:200]}\n⏱ {length}\n\nВыбери качество:"
     if menu.hidden:
-        text += "\n(качество выше не влезает в лимит Telegram — 50 МБ)"
+        text += "\n(качество выше не влезает в лимит Telegram — 50 МБ, его можно скачать в браузере)"
     return text
 
 
@@ -134,7 +135,18 @@ def menu_keyboard(menu: YoutubeMenu) -> InlineKeyboardMarkup:
         for key, label in menu.options
     ]
     rows = [buttons[i : i + 2] for i in range(0, len(buttons), 2)]
+    rows.append([browser_button(f"https://ssyoutube.com/watch?v={menu.video_id}")])
     return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def browser_button(link: str) -> InlineKeyboardButton:
+    return InlineKeyboardButton(text="🌐 Скачать в браузере (ssyoutube.com)", url=link)
+
+
+def browser_keyboard(url: str) -> InlineKeyboardMarkup | None:
+    """Кнопка-запасной путь для YouTube: открыть ролик на ssyoutube.com."""
+    link = ssyoutube_link(url)
+    return InlineKeyboardMarkup(inline_keyboard=[[browser_button(link)]]) if link else None
 
 
 @dp.callback_query(F.data.startswith("yt:"))
@@ -163,7 +175,10 @@ async def on_quality(callback: CallbackQuery) -> None:
         await target.reply("❌ Не успел скачать за 4 минуты — сайт отвечает слишком медленно.")
     except DownloadError as e:
         log.warning("youtube download failed for %s (%s): %s", video_id, choice, e)
-        await target.reply(f"❌ Не получилось скачать: {e}")
+        await target.reply(
+            f"❌ Не получилось скачать: {e}",
+            reply_markup=browser_keyboard(f"https://www.youtube.com/watch?v={video_id}"),
+        )
     except Exception:
         log.exception("unexpected error for %s (%s)", video_id, choice)
         await target.reply("❌ Что-то пошло не так, попробуй ещё раз позже.")
