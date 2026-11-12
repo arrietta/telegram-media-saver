@@ -87,6 +87,12 @@ HAS_FFMPEG = shutil.which("ffmpeg") is not None
 
 def _clean(error: object) -> str:
     text = ANSI_RE.sub("", str(error)).replace("ERROR: ", "").strip()
+    if "confirm you" in text and "not a bot" in text:
+        return (
+            "YouTube не отдаёт видео серверу без входа в аккаунт. Владельцу бота нужно "
+            "добавить на хостинг файл cookies.txt (см. README)"
+            + (" — текущий файл устарел, его надо обновить." if COOKIES else ".")
+        )
     return text[:300] or "неизвестная ошибка"
 
 
