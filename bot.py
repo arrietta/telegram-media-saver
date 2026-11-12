@@ -30,15 +30,14 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-from downloader import (  # noqa: E402 — после load_dotenv, чтобы увидеть COOKIES_FILE
+from common import MAX_BYTES, DownloadError, Media  # noqa: E402 — после load_dotenv,
+from downloader import (  # noqa: E402 — чтобы модули увидели переменные из .env
     AUDIO_EXT,
-    MAX_BYTES,
     PHOTO_EXT,
     VIDEO_EXT,
-    DownloadError,
+    browser_link,
     download,
     find_urls,
-    ssyoutube_link,
 )
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
@@ -87,12 +86,12 @@ async def handle_url(message: Message, url: str) -> None:
     tmp = Path(tempfile.mkdtemp(prefix="tms_"))
     try:
         async with downloads:
-            files = await asyncio.wait_for(download(url, tmp), DOWNLOAD_TIMEOUT)
-        log.info("downloaded %d file(s) for %s", len(files), url)
+            media = await asyncio.wait_for(download(url, tmp), DOWNLOAD_TIMEOUT)
+        log.info("downloaded %d file(s) for %s", len(media.files), url)
         with contextlib.suppress(Exception):
             await status.edit_text("📤 Отправляю…")
         async with ChatActionSender.upload_video(bot=message.bot, chat_id=message.chat.id):
-            await send_files(message, files)
+            await send_files(message, media)
     except TimeoutError:
         log.warning("download timed out for %s", url)
         await message.reply("❌ Не успел скачать за 4 минуты — сайт отвечает слишком медленно.")
@@ -114,11 +113,12 @@ def browser_button(link: str) -> InlineKeyboardButton:
 
 def browser_keyboard(url: str) -> InlineKeyboardMarkup | None:
     """Кнопка-запасной путь для YouTube: открыть ролик на ssyoutube.com."""
-    link = ssyoutube_link(url)
+    link = browser_link(url)
     return InlineKeyboardMarkup(inline_keyboard=[[browser_button(link)]]) if link else None
 
 
-async def send_files(message: Message, files: list[Path]) -> None:
+async def send_files(message: Message, media: Media) -> None:
+    files = media.files
     album: list[Path] = []  # фото и видео — уходят одним альбомом
     audio: list[Path] = []
     documents: list[Path] = []
@@ -138,7 +138,7 @@ async def send_files(message: Message, files: list[Path]) -> None:
     for i in range(0, len(album), 10):
         chunk = album[i : i + 10]
         if len(chunk) == 1:
-            await send_one(message, chunk[0])
+            await send_one(message, chunk[0], media)
         else:
             media = [
                 InputMediaVideo(media=FSInputFile(f), supports_streaming=True)
@@ -158,10 +158,17 @@ async def send_files(message: Message, files: list[Path]) -> None:
         )
 
 
-async def send_one(message: Message, f: Path) -> None:
+async def send_one(message: Message, f: Path, media: Media) -> None:
     if f.suffix.lower() in VIDEO_EXT:
         await message.reply_video(
-            FSInputFile(f), supports_streaming=True, request_timeout=UPLOAD_TIMEOUT
+            FSInputFile(f),
+            caption=media.caption[:1024] if media.caption else None,
+            # С размерами кадра Telegram сразу рисует превью нужной формы.
+            width=media.width,
+            height=media.height,
+            duration=media.duration,
+            supports_streaming=True,
+            request_timeout=UPLOAD_TIMEOUT,
         )
     else:
         await message.reply_photo(FSInputFile(f), request_timeout=UPLOAD_TIMEOUT)
