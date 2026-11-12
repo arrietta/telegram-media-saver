@@ -40,6 +40,8 @@ TIKTOK_RE = re.compile(r"https?://(?:[\w-]+\.)*tiktok\.com/", re.IGNORECASE)
 TIKTOK_SHORT_RE = re.compile(
     r"https?://(?:(?:vm|vt)\.tiktok\.com|(?:www\.)?tiktok\.com/t)/", re.IGNORECASE
 )
+# По таким параметрам в раскрытой короткой ссылке видно, что это история (Story).
+TIKTOK_STORY_RE = re.compile(r"[?&](?:story_type=1|aweme_type=40)(?:&|$)")
 ANSI_RE = re.compile(r"\x1b\[[0-9;]*m")
 # Сертификаты из certifi: у Python на macOS своих корневых сертификатов нет.
 SSL_CONTEXT = ssl.create_default_context(cafile=certifi.where())
@@ -453,6 +455,11 @@ def _download_sync(url: str, out: Path) -> list[Path]:
     # Показываем ошибку yt-dlp — она обычно самая понятная.
     main = errors[steps.index(_ytdlp)] if len(errors) == len(steps) else None
     text = main or (errors[0] if errors else "по ссылке не нашлось медиа")
+    if is_tiktok and TIKTOK_STORY_RE.search(url):
+        text = (
+            "это история (Story) TikTok — их видно только в приложении после входа "
+            "в аккаунт, по ссылке они не скачиваются. Обычные видео и фото-посты работают."
+        )
     if is_instagram and not COOKIES:
         text = f"Instagram не отдаёт это серверу без входа в аккаунт (нужен cookies.txt). {text}"
     raise DownloadError(text)
