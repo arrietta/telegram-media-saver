@@ -46,5 +46,9 @@ cp .env.example .env   # впиши BOT_TOKEN
   из браузера, где ты залогинен, и добавь его в Render как **Secret File** с именем `cookies.txt`
   (Environment → Secret Files) — бот найдёт его сам. Лучше использовать запасной аккаунт.
   TikTok обычно работает без этого.
+- Вместо cookies для YouTube можно задать переменную `RAPIDAPI_KEY` — ключ с
+  [rapidapi.com](https://rapidapi.com/DataFanatic/api/youtube-media-downloader) (сервис «YouTube Media
+  Downloader», бесплатный план — 100 роликов в месяц). Бот обращается к нему, только когда YouTube
+  не пускает сам сервер.
 - yt-dlp нужно периодически обновлять — сайты меняются. На Render для этого достаточно
   **Manual Deploy → Clear build cache & deploy**.

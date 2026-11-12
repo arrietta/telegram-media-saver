@@ -140,8 +140,76 @@ def _ytdlp_opts(out: Path, height: int, audio: bool = False) -> dict:
 
 
 def _extract(url: str) -> dict:
-    with yt_dlp.YoutubeDL(_ytdlp_opts(Path(tempfile.gettempdir()), 720)) as ydl:
-        return ydl.sanitize_info(ydl.extract_info(url, download=False) or {})
+    try:
+        with yt_dlp.YoutubeDL(_ytdlp_opts(Path(tempfile.gettempdir()), 720)) as ydl:
+            return ydl.sanitize_info(ydl.extract_info(url, download=False) or {})
+    except Exception:
+        # YouTube часто не пускает серверные IP — тогда спрашиваем сторонний API.
+        video_id = YT_ID_RE.search(url) if RAPIDAPI_KEY and is_youtube_video(url) else None
+        if not video_id:
+            raise
+        try:
+            return _rapidapi_info(video_id.group(1))
+        except Exception:  # noqa: BLE001 — запасной путь не помог, покажем исходную ошибку
+            pass
+        raise
+
+
+RAPIDAPI_KEY = os.getenv("RAPIDAPI_KEY")
+RAPIDAPI_HOST = "youtube-media-downloader.p.rapidapi.com"
+
+
+def _rapidapi_info(video_id: str) -> dict:
+    """Данные о ролике через «YouTube Media Downloader» на RapidAPI — в том же
+    виде, что отдаёт yt-dlp, чтобы дальше работал обычный код (меню, склейка)."""
+    req = urllib.request.Request(
+        f"https://{RAPIDAPI_HOST}/v2/video/details?videoId={video_id}&urlAccess=normal",
+        headers={"X-RapidAPI-Key": RAPIDAPI_KEY or "", "X-RapidAPI-Host": RAPIDAPI_HOST},
+    )
+    with urllib.request.urlopen(req, timeout=30, context=SSL_CONTEXT) as resp:
+        data = json.loads(resp.read())
+    if data.get("errorId") != "Success":
+        raise DownloadError(f"RapidAPI: {data.get('errorId') or data.get('message')}")
+    duration = int(data.get("lengthSeconds") or 0)
+
+    formats = []
+    streams = [(v, True) for v in (data.get("videos") or {}).get("items") or []]
+    streams += [(a, False) for a in (data.get("audios") or {}).get("items") or []]
+    for i, (item, is_video) in enumerate(streams):
+        if not item.get("url") or item.get("isDrc"):
+            continue
+        codecs = re.search(r'codecs="([^"]*)"', item.get("mimeType") or "")
+        codecs = [c.strip() for c in codecs.group(1).split(",")] if codecs else ["unknown"]
+        size = int(item.get("size") or 0)
+        fmt = {
+            "format_id": str(i),
+            "url": item["url"],
+            "ext": {"weba": "webm"}.get(item.get("extension"), item.get("extension") or "mp4"),
+            "protocol": "https",
+            "filesize": size or None,
+            "tbr": size * 8 / 1000 / duration if size and duration else None,
+            # Без скачивания кусками YouTube режет скорость (так же делает yt-dlp).
+            "downloader_options": {"http_chunk_size": 10 * 1024 * 1024},
+        }
+        if is_video:
+            fmt["vcodec"] = codecs[0]
+            fmt["acodec"] = (codecs[1] if len(codecs) > 1 else "aac") if item.get("hasAudio") else "none"
+            fmt["height"], fmt["width"] = item.get("height"), item.get("width")
+        else:
+            fmt["vcodec"], fmt["acodec"] = "none", codecs[0]
+        formats.append(fmt)
+    if not formats:
+        raise DownloadError("RapidAPI: нет ссылок на видео")
+    return {
+        "id": video_id,
+        "title": data.get("title") or "",
+        "duration": duration,
+        "is_live": bool(data.get("isLiveNow")),
+        "formats": formats,
+        "extractor": "youtube",
+        "extractor_key": "Youtube",
+        "webpage_url": f"https://www.youtube.com/watch?v={video_id}",
+    }
 
 
 def _is_single(info: dict) -> bool:
