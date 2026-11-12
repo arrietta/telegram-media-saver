@@ -112,7 +112,9 @@ def _ytdlp_opts(out: Path, height: int, audio: bool = False) -> dict:
         # m4a Telegram проигрывает как музыку без перекодирования.
         fmt = "ba[ext=m4a]/ba/b"
     elif HAS_FFMPEG:
-        fmt = f"bv*[height<={height}]+ba/b[height<={height}]/b"
+        # Сначала дорожка «только видео» + звук: иначе из-за сортировки по aac
+        # yt-dlp на YouTube всегда берёт готовый файл 360p вместо нужного качества.
+        fmt = f"bv[height<={height}]+ba/b[height<={height}]/bv*[height<={height}]+ba/b"
     else:
         # Без ffmpeg склеить видео и звук нечем — берём готовый файл похуже качеством.
         fmt = f"b[height<={height}]/b"
@@ -194,7 +196,9 @@ def _rapidapi_info(video_id: str) -> dict:
         if is_video:
             fmt["vcodec"] = codecs[0]
             fmt["acodec"] = (codecs[1] if len(codecs) > 1 else "aac") if item.get("hasAudio") else "none"
-            fmt["height"], fmt["width"] = item.get("height"), item.get("width")
+            # API отдаёт числа строками, а yt-dlp сравнивает высоту как число.
+            fmt["height"] = int(item.get("height") or 0) or None
+            fmt["width"] = int(item.get("width") or 0) or None
         else:
             fmt["vcodec"], fmt["acodec"] = "none", codecs[0]
         formats.append(fmt)
