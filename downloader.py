@@ -10,7 +10,9 @@ import ssl
 import subprocess
 import sys
 import tempfile
+import time
 import urllib.request
+from dataclasses import dataclass, field
 from pathlib import Path
 
 import certifi
@@ -20,6 +22,10 @@ import yt_dlp
 MAX_BYTES = 49 * 1024 * 1024
 MAX_DURATION = 60 * 60  # секунд; более длинное видео всё равно не влезет в 50 МБ
 MAX_ITEMS = 10  # столько файлов помещается в один альбом Telegram
+TIKTOK_MAX_ITEMS = 36  # в слайд-шоу TikTok до 35 фото + звуковая дорожка
+# Качества, которые бот предлагает на выбор для YouTube (как на ssyoutube.com).
+YT_HEIGHTS = (1080, 720, 480, 360, 240, 144)
+YT_CACHE_TTL = 30 * 60  # секунд; прямые ссылки YouTube живут несколько часов
 
 URL_RE = re.compile(
     r"https?://(?:[\w-]+\.)*(?:instagram\.com|youtube\.com|youtu\.be|tiktok\.com)/[^\s<>]+",
@@ -27,6 +33,11 @@ URL_RE = re.compile(
 )
 PHOTO_FIRST_RE = re.compile(r"instagram\.com/p/|tiktok\.com/.+/photo/", re.IGNORECASE)
 YT_POST_RE = re.compile(r"youtube\.com/post/", re.IGNORECASE)
+YT_RE = re.compile(r"https?://(?:[\w-]+\.)*(?:youtube\.com|youtu\.be)/", re.IGNORECASE)
+TIKTOK_RE = re.compile(r"https?://(?:[\w-]+\.)*tiktok\.com/", re.IGNORECASE)
+TIKTOK_SHORT_RE = re.compile(
+    r"https?://(?:(?:vm|vt)\.tiktok\.com|(?:www\.)?tiktok\.com/t)/", re.IGNORECASE
+)
 ANSI_RE = re.compile(r"\x1b\[[0-9;]*m")
 # Сертификаты из certifi: у Python на macOS своих корневых сертификатов нет.
 SSL_CONTEXT = ssl.create_default_context(cafile=certifi.where())
@@ -86,13 +97,18 @@ def _clear(out: Path) -> None:
             p.unlink()
 
 
-def _ytdlp_opts(out: Path, height: int) -> dict:
+def _ytdlp_opts(out: Path, height: int, audio: bool = False) -> dict:
+    if audio:
+        # m4a Telegram проигрывает как музыку без перекодирования.
+        fmt = "ba[ext=m4a]/ba/b"
+    elif HAS_FFMPEG:
+        fmt = f"bv*[height<={height}]+ba/b[height<={height}]/b"
+    else:
+        # Без ffmpeg склеить видео и звук нечем — берём готовый файл похуже качеством.
+        fmt = f"b[height<={height}]/b"
     opts = {
         "outtmpl": str(out / "%(autonumber)02d_%(id)s.%(ext)s"),
-        # Без ffmpeg склеить видео и звук нечем — берём готовый файл похуже качеством.
-        "format": f"bv*[height<={height}]+ba/b[height<={height}]/b"
-        if HAS_FFMPEG
-        else f"b[height<={height}]/b",
+        "format": fmt,
         # h264 + aac в mp4 — то, что Telegram проигрывает прямо в чате.
         "format_sort": ["vcodec:h264", "acodec:aac", "ext:mp4:m4a"],
         "merge_output_format": "mp4",
@@ -106,27 +122,50 @@ def _ytdlp_opts(out: Path, height: int) -> dict:
         "retries": 2,
         "extractor_retries": 1,
     }
+    if audio and HAS_FFMPEG:
+        opts["postprocessors"] = [{"key": "FFmpegExtractAudio", "preferredcodec": "m4a"}]
     if COOKIES:
         opts["cookiefile"] = COOKIES
     return opts
 
 
-def _ytdlp(url: str, out: Path) -> None:
-    with yt_dlp.YoutubeDL(_ytdlp_opts(out, 720)) as ydl:
-        info = ydl.sanitize_info(ydl.extract_info(url, download=False) or {})
+def _extract(url: str) -> dict:
+    with yt_dlp.YoutubeDL(_ytdlp_opts(Path(tempfile.gettempdir()), 720)) as ydl:
+        return ydl.sanitize_info(ydl.extract_info(url, download=False) or {})
+
+
+def _is_single(info: dict) -> bool:
+    return info.get("_type", "video") == "video" and bool(info.get("formats"))
+
+
+def _ytdlp(
+    url: str,
+    out: Path,
+    *,
+    info: dict | None = None,
+    heights: tuple[int, ...] | None = None,
+    audio: bool = False,
+) -> None:
+    """heights/audio задаются, когда качество выбрал пользователь (меню YouTube)."""
+    chosen = heights is not None or audio
+    if info is None:
+        info = _extract(url)
     # Разбор страницы — самая медленная часть на слабом сервере, поэтому для
     # одиночного видео делаем его один раз и дальше качаем по готовым данным.
-    single = info.get("_type", "video") == "video" and bool(info.get("formats"))
+    single = _is_single(info)
     if info.get("is_live"):
         raise DownloadError("это прямой эфир, его скачать нельзя")
-    if (info.get("duration") or 0) > MAX_DURATION:
+    if not chosen and (info.get("duration") or 0) > MAX_DURATION:
         raise DownloadError("видео длиннее часа — в лимит Telegram (50 МБ) не влезет")
 
     # На YouTube есть выбор качества: понижаем его, пока файл не влезет в лимит.
-    is_youtube = "youtu" in url.lower()
-    for height in (720, 480, 360) if is_youtube else (1080,):
+    if audio:
+        heights = (0,)
+    elif heights is None:
+        heights = (720, 480, 360) if YT_RE.match(url) else (1080,)
+    for height in heights:
         _clear(out)
-        with yt_dlp.YoutubeDL(_ytdlp_opts(out, height)) as ydl:
+        with yt_dlp.YoutubeDL(_ytdlp_opts(out, height, audio)) as ydl:
             if single:
                 ydl.process_ie_result(copy.deepcopy(info), download=True)
             else:
@@ -136,10 +175,142 @@ def _ytdlp(url: str, out: Path) -> None:
             return
 
 
+@dataclass
+class YoutubeMenu:
+    """Что показать пользователю перед скачиванием ролика с YouTube."""
+
+    video_id: str
+    title: str
+    duration: int
+    # (ключ, подпись): ключ — высота кадра или "audio".
+    options: list[tuple[str, str]] = field(default_factory=list)
+    hidden: int = 0  # сколько качеств не влезло в лимит Telegram
+
+
+_yt_cache: dict[str, tuple[float, dict]] = {}
+
+
+def _yt_cached(video_id: str) -> dict | None:
+    now = time.monotonic()
+    for key in [k for k, (ts, _) in _yt_cache.items() if now - ts > YT_CACHE_TTL]:
+        del _yt_cache[key]
+    entry = _yt_cache.get(video_id)
+    return entry[1] if entry else None
+
+
+def _selected(info: dict, height: int, audio: bool = False) -> tuple[int, int | None]:
+    """Какое качество реально достанется при таком выборе и сколько оно весит
+    (None — размер неизвестен). Сеть не трогает: считает по готовым данным."""
+    with yt_dlp.YoutubeDL(_ytdlp_opts(Path(tempfile.gettempdir()), height, audio)) as ydl:
+        res = ydl.process_ie_result(copy.deepcopy(info), download=False)
+    total = 0
+    for f in res.get("requested_formats") or [res]:
+        size = f.get("filesize") or f.get("filesize_approx")
+        if not size and f.get("tbr") and info.get("duration"):
+            size = f["tbr"] * 1000 / 8 * info["duration"]
+        if not size:
+            return res.get("height") or 0, None
+        total += int(size)
+    return res.get("height") or 0, total
+
+
+def _mb(size: int | None) -> str:
+    if size is None:
+        return ""
+    return f" · {max(size / 1024 / 1024, 0.1):.1f} МБ".replace(".0 ", " ")
+
+
+def _youtube_menu_sync(url: str) -> YoutubeMenu | None:
+    info = _extract(url)
+    if not _is_single(info) or not info.get("id"):
+        return None  # плейлист, канал и т. п. — пусть идёт обычным путём
+    if info.get("is_live"):
+        raise DownloadError("это прямой эфир, его скачать нельзя")
+    _yt_cache[info["id"]] = (time.monotonic(), info)
+
+    menu = YoutubeMenu(info["id"], info.get("title") or "", int(info.get("duration") or 0))
+    seen: set[int] = set()
+    for height in YT_HEIGHTS:
+        try:
+            real, size = _selected(info, height)
+        except Exception:  # noqa: BLE001 — такого качества у ролика нет
+            continue
+        if not real or real in seen:
+            continue
+        seen.add(real)
+        if size is not None and size > MAX_BYTES:
+            menu.hidden += 1
+            continue
+        menu.options.append((str(real), f"📹 {real}p{_mb(size)}"))
+    try:
+        _, size = _selected(info, 0, audio=True)
+        if size is None or size <= MAX_BYTES:
+            menu.options.append(("audio", f"🎵 Аудио{_mb(size)}"))
+    except Exception:  # noqa: BLE001
+        pass
+    if not menu.options:
+        raise DownloadError("даже в самом низком качестве видео больше 50 МБ — лимит Telegram")
+    return menu
+
+
+def _youtube_download_sync(video_id: str, choice: str, out: Path) -> tuple[list[Path], str]:
+    url = f"https://www.youtube.com/watch?v={video_id}"
+    try:
+        info = _yt_cached(video_id) or _extract(url)
+        if choice == "audio":
+            _ytdlp(url, out, info=info, audio=True)
+        else:
+            # Размер в меню — оценка; если не угадали, спускаемся на ступень ниже.
+            heights = tuple(h for h in YT_HEIGHTS if h <= int(choice)) or (int(choice),)
+            _ytdlp(url, out, info=info, heights=heights)
+    except DownloadError:
+        raise
+    except Exception as e:  # noqa: BLE001
+        raise DownloadError(_clean(e)) from None
+    files = _files(out)
+    if not files:
+        raise DownloadError("по ссылке не нашлось медиа")
+    return files, info.get("title") or ""
+
+
+def is_youtube_video(url: str) -> bool:
+    """Ссылки YouTube, для которых стоит показать меню качества."""
+    return bool(YT_RE.match(url)) and not YT_POST_RE.search(url)
+
+
+async def youtube_menu(url: str) -> YoutubeMenu | None:
+    try:
+        return await asyncio.to_thread(_youtube_menu_sync, url)
+    except DownloadError:
+        raise
+    except Exception as e:  # noqa: BLE001
+        raise DownloadError(_clean(e)) from None
+
+
+async def youtube_download(video_id: str, choice: str, out: Path) -> tuple[list[Path], str]:
+    return await asyncio.to_thread(_youtube_download_sync, video_id, choice, out)
+
+
+def _resolve_tiktok(url: str) -> str:
+    """Короткие ссылки (vm.tiktok.com/…) не говорят, видео там или фото —
+    раскрываем их до полной."""
+    if not TIKTOK_SHORT_RE.match(url):
+        return url
+    try:
+        req = urllib.request.Request(
+            url, method="HEAD", headers={"User-Agent": "facebookexternalhit/1.1"}
+        )
+        with urllib.request.urlopen(req, timeout=10, context=SSL_CONTEXT) as resp:
+            return resp.url
+    except Exception:  # noqa: BLE001 — не вышло, пробуем как есть
+        return url
+
+
 def _gallery(url: str, out: Path) -> None:
     # Без повторов и с коротким таймаутом: если сайт требует вход, gallery-dl
     # должен сдаться быстро, а не держать пользователя минутами.
-    cmd = [sys.executable, "-m", "gallery_dl", "-D", str(out), "--range", f"1-{MAX_ITEMS}"]
+    limit = TIKTOK_MAX_ITEMS if TIKTOK_RE.match(url) else MAX_ITEMS
+    cmd = [sys.executable, "-m", "gallery_dl", "-D", str(out), "--range", f"1-{limit}"]
     cmd += ["--retries", "0", "--http-timeout", "15"]
     if COOKIES:
         cmd += ["--cookies", COOKIES]
@@ -207,6 +378,10 @@ def _download_sync(url: str, out: Path) -> list[Path]:
             raise DownloadError(_clean(e)) from None
         return _files(out)
 
+    is_tiktok = bool(TIKTOK_RE.match(url))
+    if is_tiktok:
+        url = _resolve_tiktok(url)
+
     # Посты Instagram и фото-посты TikTok — это часто картинки, с ними лучше
     # справляется gallery-dl; для всего остального сначала пробуем yt-dlp.
     steps = [_gallery, _ytdlp] if PHOTO_FIRST_RE.search(url) else [_ytdlp, _gallery]
@@ -223,6 +398,12 @@ def _download_sync(url: str, out: Path) -> list[Path]:
             errors.append(_clean(e))
             continue
         files = _files(out)
+        if is_tiktok and step is _ytdlp and files and step is not steps[-1]:
+            # Из фото-поста TikTok yt-dlp достаёт только музыку — за самими
+            # фотографиями идём в gallery-dl.
+            if all(f.suffix.lower() in AUDIO_EXT for f in files):
+                errors.append("это фото-пост")
+                continue
         if files:
             return files
     # Показываем ошибку yt-dlp — она обычно самая понятная.
