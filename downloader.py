@@ -11,10 +11,8 @@ import ssl
 import subprocess
 import sys
 import tempfile
-import time
 import urllib.parse
 import urllib.request
-from dataclasses import dataclass, field
 from pathlib import Path
 
 import certifi
@@ -25,9 +23,8 @@ MAX_BYTES = 49 * 1024 * 1024
 MAX_DURATION = 60 * 60  # секунд; более длинное видео всё равно не влезет в 50 МБ
 MAX_ITEMS = 10  # столько файлов помещается в один альбом Telegram
 TIKTOK_MAX_ITEMS = 36  # в слайд-шоу TikTok до 35 фото + звуковая дорожка
-# Качества, которые бот предлагает на выбор для YouTube (как на ssyoutube.com).
-YT_HEIGHTS = (1080, 720, 480, 360, 240, 144)
-YT_CACHE_TTL = 30 * 60  # секунд; прямые ссылки YouTube живут несколько часов
+# Качества YouTube от лучшего к худшему; выше 720p в чате смысла мало, а файл тяжелее.
+YT_HEIGHTS = (720, 480, 360, 240, 144)
 
 URL_RE = re.compile(
     r"https?://(?:[\w-]+\.)*(?:instagram\.com|youtube\.com|youtu\.be|tiktok\.com)/[^\s<>]+",
@@ -107,11 +104,8 @@ def _clear(out: Path) -> None:
             p.unlink()
 
 
-def _ytdlp_opts(out: Path, height: int, audio: bool = False) -> dict:
-    if audio:
-        # m4a Telegram проигрывает как музыку без перекодирования.
-        fmt = "ba[ext=m4a]/ba/b"
-    elif HAS_FFMPEG:
+def _ytdlp_opts(out: Path, height: int) -> dict:
+    if HAS_FFMPEG:
         # Сначала дорожка «только видео» + звук: иначе из-за сортировки по aac
         # yt-dlp на YouTube всегда берёт готовый файл 360p вместо нужного качества.
         fmt = f"bv[height<={height}]+ba/b[height<={height}]/bv*[height<={height}]+ba/b"
@@ -134,8 +128,6 @@ def _ytdlp_opts(out: Path, height: int, audio: bool = False) -> dict:
         "retries": 2,
         "extractor_retries": 1,
     }
-    if audio and HAS_FFMPEG:
-        opts["postprocessors"] = [{"key": "FFmpegExtractAudio", "preferredcodec": "m4a"}]
     if COOKIES:
         opts["cookiefile"] = COOKIES
     return opts
@@ -220,70 +212,10 @@ def _is_single(info: dict) -> bool:
     return info.get("_type", "video") == "video" and bool(info.get("formats"))
 
 
-def _ytdlp(
-    url: str,
-    out: Path,
-    *,
-    info: dict | None = None,
-    heights: tuple[int, ...] | None = None,
-    audio: bool = False,
-) -> None:
-    """heights/audio задаются, когда качество выбрал пользователь (меню YouTube)."""
-    chosen = heights is not None or audio
-    if info is None:
-        info = _extract(url)
-    # Разбор страницы — самая медленная часть на слабом сервере, поэтому для
-    # одиночного видео делаем его один раз и дальше качаем по готовым данным.
-    single = _is_single(info)
-    if info.get("is_live"):
-        raise DownloadError("это прямой эфир, его скачать нельзя")
-    if not chosen and (info.get("duration") or 0) > MAX_DURATION:
-        raise DownloadError("видео длиннее часа — в лимит Telegram (50 МБ) не влезет")
-
-    # На YouTube есть выбор качества: понижаем его, пока файл не влезет в лимит.
-    if audio:
-        heights = (0,)
-    elif heights is None:
-        heights = (720, 480, 360) if YT_RE.match(url) else (1080,)
-    for height in heights:
-        _clear(out)
-        with yt_dlp.YoutubeDL(_ytdlp_opts(out, height, audio)) as ydl:
-            if single:
-                ydl.process_ie_result(copy.deepcopy(info), download=True)
-            else:
-                ydl.download([url])
-        files = _files(out)
-        if files and max(f.stat().st_size for f in files) <= MAX_BYTES:
-            return
-
-
-@dataclass
-class YoutubeMenu:
-    """Что показать пользователю перед скачиванием ролика с YouTube."""
-
-    video_id: str
-    title: str
-    duration: int
-    # (ключ, подпись): ключ — высота кадра или "audio".
-    options: list[tuple[str, str]] = field(default_factory=list)
-    hidden: int = 0  # сколько качеств не влезло в лимит Telegram
-
-
-_yt_cache: dict[str, tuple[float, dict]] = {}
-
-
-def _yt_cached(video_id: str) -> dict | None:
-    now = time.monotonic()
-    for key in [k for k, (ts, _) in _yt_cache.items() if now - ts > YT_CACHE_TTL]:
-        del _yt_cache[key]
-    entry = _yt_cache.get(video_id)
-    return entry[1] if entry else None
-
-
-def _selected(info: dict, height: int, audio: bool = False) -> tuple[int, int | None]:
-    """Какое качество реально достанется при таком выборе и сколько оно весит
-    (None — размер неизвестен). Сеть не трогает: считает по готовым данным."""
-    with yt_dlp.YoutubeDL(_ytdlp_opts(Path(tempfile.gettempdir()), height, audio)) as ydl:
+def _selected(info: dict, height: int) -> tuple[int, int | None]:
+    """Какое качество реально достанется при таком ограничении и сколько оно
+    весит (None — размер неизвестен). Сеть не трогает: считает по готовым данным."""
+    with yt_dlp.YoutubeDL(_ytdlp_opts(Path(tempfile.gettempdir()), height)) as ydl:
         res = ydl.process_ie_result(copy.deepcopy(info), download=False)
     total = 0
     for f in res.get("requested_formats") or [res]:
@@ -296,66 +228,58 @@ def _selected(info: dict, height: int, audio: bool = False) -> tuple[int, int | 
     return res.get("height") or 0, total
 
 
-def _mb(size: int | None) -> str:
-    if size is None:
-        return ""
-    return f" · {max(size / 1024 / 1024, 0.1):.1f} МБ".replace(".0 ", " ")
-
-
-def _youtube_menu_sync(url: str) -> YoutubeMenu | None:
-    info = _extract(url)
-    if not _is_single(info) or not info.get("id"):
-        return None  # плейлист, канал и т. п. — пусть идёт обычным путём
-    if info.get("is_live"):
-        raise DownloadError("это прямой эфир, его скачать нельзя")
-    _yt_cache[info["id"]] = (time.monotonic(), info)
-
-    menu = YoutubeMenu(info["id"], info.get("title") or "", int(info.get("duration") or 0))
-    seen: set[int] = set()
+def _youtube_heights(info: dict) -> list[int]:
+    """Качества YouTube от лучшего к худшему, которые по оценке влезают в лимит
+    Telegram, — чтобы не качать зря то, что всё равно не отправить."""
+    heights: list[int] = []
     for height in YT_HEIGHTS:
         try:
             real, size = _selected(info, height)
         except Exception:  # noqa: BLE001 — такого качества у ролика нет
             continue
-        if not real or real in seen:
-            continue
-        seen.add(real)
-        if size is not None and size > MAX_BYTES:
-            menu.hidden += 1
-            continue
-        menu.options.append((str(real), f"📹 {real}p{_mb(size)}"))
-    try:
-        _, size = _selected(info, 0, audio=True)
-        if size is None or size <= MAX_BYTES:
-            menu.options.append(("audio", f"🎵 Аудио{_mb(size)}"))
-    except Exception:  # noqa: BLE001
-        pass
-    if not menu.options:
-        raise DownloadError("даже в самом низком качестве видео больше 50 МБ — лимит Telegram")
-    return menu
+        if real and real not in heights and (size is None or size <= MAX_BYTES):
+            heights.append(real)
+    if not heights:
+        raise DownloadError(
+            "видео слишком длинное: даже в самом низком качестве оно больше 50 МБ — "
+            "это лимит Telegram для ботов"
+        )
+    return heights
 
 
-def _youtube_download_sync(video_id: str, choice: str, out: Path) -> tuple[list[Path], str]:
-    url = f"https://www.youtube.com/watch?v={video_id}"
-    try:
-        info = _yt_cached(video_id) or _extract(url)
-        if choice == "audio":
-            _ytdlp(url, out, info=info, audio=True)
-        else:
-            # Размер в меню — оценка; если не угадали, спускаемся на ступень ниже.
-            heights = tuple(h for h in YT_HEIGHTS if h <= int(choice)) or (int(choice),)
-            _ytdlp(url, out, info=info, heights=heights)
-    except DownloadError:
-        raise
-    except Exception as e:  # noqa: BLE001
-        raise DownloadError(_clean(e)) from None
-    files = _files(out)
-    if not files:
-        raise DownloadError("по ссылке не нашлось медиа")
-    return files, info.get("title") or ""
+def _ytdlp(url: str, out: Path) -> None:
+    info = _extract(url)
+    # Разбор страницы — самая медленная часть на слабом сервере, поэтому для
+    # одиночного видео делаем его один раз и дальше качаем по готовым данным.
+    single = _is_single(info)
+    if info.get("is_live"):
+        raise DownloadError("это прямой эфир, его скачать нельзя")
+
+    # На YouTube есть выбор качества: берём лучшее, что влезает в лимит Telegram,
+    # и спускаемся ниже, если оценка размера не оправдалась.
+    if single and YT_RE.match(url):
+        heights = _youtube_heights(info)
+    else:
+        if (info.get("duration") or 0) > MAX_DURATION:
+            raise DownloadError("видео длиннее часа — в лимит Telegram (50 МБ) не влезет")
+        heights = [720, 480, 360] if YT_RE.match(url) else [1080]
+    for height in heights:
+        _clear(out)
+        with yt_dlp.YoutubeDL(_ytdlp_opts(out, height)) as ydl:
+            if single:
+                ydl.process_ie_result(copy.deepcopy(info), download=True)
+            else:
+                ydl.download([url])
+        files = _files(out)
+        if files and max(f.stat().st_size for f in files) <= MAX_BYTES:
+            return
 
 
 YT_ID_RE = re.compile(r"(?:[?&]v=|youtu\.be/|/shorts/|/embed/|/live/)([\w-]{11})")
+
+
+def is_youtube_video(url: str) -> bool:
+    return bool(YT_RE.match(url)) and not YT_POST_RE.search(url)
 
 
 def ssyoutube_link(url: str) -> str | None:
@@ -363,24 +287,6 @@ def ssyoutube_link(url: str) -> str | None:
     когда бот не может (YouTube требует вход или файл больше 50 МБ)."""
     match = YT_ID_RE.search(url) if is_youtube_video(url) else None
     return f"https://ssyoutube.com/watch?v={match.group(1)}" if match else None
-
-
-def is_youtube_video(url: str) -> bool:
-    """Ссылки YouTube, для которых стоит показать меню качества."""
-    return bool(YT_RE.match(url)) and not YT_POST_RE.search(url)
-
-
-async def youtube_menu(url: str) -> YoutubeMenu | None:
-    try:
-        return await asyncio.to_thread(_youtube_menu_sync, url)
-    except DownloadError:
-        raise
-    except Exception as e:  # noqa: BLE001
-        raise DownloadError(_clean(e)) from None
-
-
-async def youtube_download(video_id: str, choice: str, out: Path) -> tuple[list[Path], str]:
-    return await asyncio.to_thread(_youtube_download_sync, video_id, choice, out)
 
 
 def _resolve_tiktok(url: str) -> str:
