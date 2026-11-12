@@ -1,204 +1,141 @@
 """YouTube: один простой путь.
 
-YouTube не пускает серверы хостингов («Sign in to confirm you're not a bot»),
-поэтому сами мы его не разбираем. Ссылки на готовые дорожки отдаёт сервис
-«YouTube Media Downloader» на RapidAPI, а бот только скачивает видео и звук
-и склеивает их ffmpeg без перекодирования.
+Ссылка → лучшее качество до 720p, которое влезает в лимит Telegram → mp4
+с названием ролика в подписи. Разбирает и качает yt-dlp, видео со звуком
+склеивает ffmpeg без перекодирования.
 
-Ссылка → лучшее качество до 720p, которое влезает в лимит Telegram → mp4.
+На хостинге YouTube требует вход («Sign in to confirm you're not a bot») —
+там нужен файл cookies.txt, см. README.
 """
 
-import json
+import copy
 import logging
-import os
 import re
-import subprocess
-import time
-import urllib.error
-import urllib.request
-from dataclasses import dataclass
 from pathlib import Path
 
-from common import BROWSER_UA, HAS_FFMPEG, MAX_BYTES, SSL_CONTEXT, DownloadError, Media
+import yt_dlp
+
+from common import COOKIES, HAS_FFMPEG, MAX_BYTES, DownloadError, Media
 
 log = logging.getLogger("youtube")
 
-API_HOST = "youtube-media-downloader.p.rapidapi.com"
-API_KEY = (os.getenv("RAPIDAPI_KEY") or "").strip()
-
-MAX_QUALITY = 720  # выше в чате разницы не видно, а файл вдвое тяжелее
+QUALITIES = (720, 480, 360, 240, 144)  # выше 720p в чате разницы не видно, а файл тяжелее
 MIN_QUALITY = 360  # ниже — уже каша; лучше честно сказать, что видео не влезает
-CHUNK = 10 * 1024 * 1024  # YouTube режет скорость, если качать файл одним запросом
 
 ID_RE = re.compile(r"(?:[?&]v=|youtu\.be/|/shorts/|/embed/|/live/)([\w-]{11})")
-
-
-def video_id(url: str) -> str | None:
-    match = ID_RE.search(url)
-    return match.group(1) if match else None
+ANSI_RE = re.compile(r"\x1b\[[0-9;]*m")
 
 
 def browser_link(url: str) -> str | None:
     """Тот же ролик на ssyoutube.com — запасной выход, когда бот не справился."""
-    vid = video_id(url)
-    return f"https://ssyoutube.com/watch?v={vid}" if vid else None
+    match = ID_RE.search(url)
+    return f"https://ssyoutube.com/watch?v={match.group(1)}" if match else None
 
 
-@dataclass
-class Choice:
-    video: dict
-    audio: dict | None  # None — в видеодорожке уже есть звук
-    quality: int
-
-    @property
-    def size(self) -> int:
-        return _size(self.video) + (_size(self.audio) if self.audio else 0)
-
-
-def _size(item: dict) -> int:
-    return int(item.get("size") or 0)
-
-
-def _quality(item: dict) -> int:
+def _opts(out: Path, quality: int, vertical: bool) -> dict:
     # У вертикальных Shorts «720p» — это ширина, поэтому меряем по короткой стороне.
-    return min(int(item.get("width") or 0), int(item.get("height") or 0))
+    side = f"[{'width' if vertical else 'height'}<={quality}]"
+    opts = {
+        "outtmpl": str(out / "%(id)s.%(ext)s"),
+        # Без ffmpeg склеить видео и звук нечем — тогда только готовый файл со звуком.
+        "format": f"bv{side}+ba/b{side}" if HAS_FFMPEG else f"b{side}",
+        # h264 + aac в mp4 — то, что Telegram проигрывает прямо в чате на любом телефоне.
+        "format_sort": ["vcodec:h264", "acodec:aac", "ext:mp4:m4a"],
+        "merge_output_format": "mp4",
+        "noplaylist": True,
+        "quiet": True,
+        "no_warnings": True,
+        "noprogress": True,
+        "socket_timeout": 20,
+        "retries": 2,
+        "extractor_retries": 1,
+    }
+    if COOKIES:
+        opts["cookiefile"] = COOKIES
+    return opts
 
 
-def _details(vid: str) -> dict:
-    req = urllib.request.Request(
-        f"https://{API_HOST}/v2/video/details?videoId={vid}&urlAccess=normal",
-        headers={"X-RapidAPI-Key": API_KEY, "X-RapidAPI-Host": API_HOST},
-    )
+def _explain(error: object) -> str:
+    text = ANSI_RE.sub("", str(error)).replace("ERROR: ", "").strip()
+    if "confirm you" in text and "not a bot" in text:
+        return "YouTube не пускает сервер без входа в аккаунт — " + (
+            "файл cookies.txt на хостинге устарел, его нужно обновить (см. README)"
+            if COOKIES
+            else "на хостинг нужно добавить файл cookies.txt (см. README)"
+        )
+    return text[:300] or "неизвестная ошибка"
+
+
+def _pick(info: dict, quality: int, vertical: bool) -> dict | None:
+    """Что yt-dlp выберет при таком потолке качества: настоящее качество и вес
+    (None — неизвестен). Сеть не трогает, считает по уже полученным данным."""
     try:
-        with urllib.request.urlopen(req, timeout=30, context=SSL_CONTEXT) as resp:
-            data = json.loads(resp.read())
-    except urllib.error.HTTPError as e:
-        body = e.read(200).decode(errors="replace")
-        log.warning("RapidAPI HTTP %s for %s: %s", e.code, vid, body)
-        if e.code == 429:
-            raise DownloadError("на этот месяц закончился лимит RapidAPI") from None
-        if e.code in (401, 403):
-            raise DownloadError(
-                "RapidAPI не принял ключ — проверь RAPIDAPI_KEY и подписку на "
-                "YouTube Media Downloader"
-            ) from None
-        if e.code == 404:
-            raise DownloadError("такого видео на YouTube нет") from None
-        raise DownloadError(f"RapidAPI ответил ошибкой {e.code}") from None
-    if data.get("errorId") != "Success":
-        log.warning("RapidAPI error for %s: %s", vid, data.get("errorId"))
-        raise DownloadError("YouTube не отдаёт это видео (удалено, закрыто или с ограничением)")
-    return data
+        with yt_dlp.YoutubeDL(_opts(Path("."), quality, vertical)) as ydl:
+            res = ydl.process_ie_result(copy.deepcopy(info), download=False)
+    except Exception:  # noqa: BLE001 — такого качества у ролика нет
+        return None
+    size = 0
+    for f in res.get("requested_formats") or [res]:
+        part = f.get("filesize") or f.get("filesize_approx")
+        if not part and f.get("tbr") and info.get("duration"):
+            part = f["tbr"] * 1000 / 8 * info["duration"]
+        size = None if size is None or not part else size + int(part)
+    width, height = res.get("width") or 0, res.get("height") or 0
+    return {"quality": min(width, height) or height, "size": size, "width": width, "height": height}
 
 
-def _choose(data: dict) -> Choice:
-    # Только h264 + aac в mp4: это Telegram проигрывает прямо в чате на любом телефоне.
-    videos = [
-        v
-        for v in (data.get("videos") or {}).get("items") or []
-        if v.get("url") and "avc1" in (v.get("mimeType") or "") and _quality(v)
-    ]
-    audio = next(
-        (
-            a
-            for a in (data.get("audios") or {}).get("items") or []
-            if a.get("url") and a.get("extension") == "m4a" and not a.get("isDrc")
-        ),
-        None,
-    )
-    choices = [
-        Choice(v, None if v.get("hasAudio") else audio, _quality(v))
-        for v in videos
-        # Без ffmpeg склеивать нечем — годятся только дорожки сразу со звуком.
-        if v.get("hasAudio") or (audio and HAS_FFMPEG)
-    ]
-    choices = [c for c in choices if c.quality <= MAX_QUALITY and c.size]
-    if not choices:
+def _choices(info: dict) -> list[dict]:
+    """Варианты от лучшего к худшему, которые не стыдно отправить и которые
+    по оценке влезают в лимит Telegram."""
+    vertical = (info.get("width") or 0) < (info.get("height") or 0)
+    picks: list[dict] = []
+    for quality in QUALITIES:
+        pick = _pick(info, quality, vertical)
+        if pick and pick["quality"] not in [p["quality"] for p in picks]:
+            picks.append({**pick, "limit": quality, "vertical": vertical})
+    if not picks:
         raise DownloadError("у этого видео нет подходящего формата")
 
-    # Лучшее качество; при равном — файл полегче.
-    choices.sort(key=lambda c: (-c.quality, c.size))
-    floor = min(MIN_QUALITY, choices[0].quality)  # у старых роликов 360p может и не быть
-    for choice in choices:
-        if choice.quality >= floor and choice.size <= MAX_BYTES:
-            return choice
-
-    smallest = min((c for c in choices if c.quality >= floor), key=lambda c: c.size)
-    minutes = max(int(data.get("lengthSeconds") or 0) // 60, 1)
-    raise DownloadError(
-        f"ролик идёт {minutes} мин и даже в {smallest.quality}p весит "
-        f"{smallest.size // 1024 // 1024} МБ, а Telegram пропускает ботам не больше 50 МБ"
-    )
-
-
-def _get(url: str, path: Path, size: int) -> None:
-    """Качает файл кусками по CHUNK, с парой повторов на каждый кусок."""
-    done = 0
-    with path.open("wb") as f:
-        while not size or done < size:
-            headers = {"User-Agent": BROWSER_UA}
-            if size:
-                headers["Range"] = f"bytes={done}-{min(done + CHUNK, size) - 1}"
-            for attempt in range(3):
-                try:
-                    req = urllib.request.Request(url, headers=headers)
-                    with urllib.request.urlopen(req, timeout=30, context=SSL_CONTEXT) as resp:
-                        part = resp.read()
-                    break
-                except urllib.error.HTTPError as e:
-                    if e.code == 403:
-                        raise DownloadError(
-                            "YouTube не отдал файл серверу по ссылке от RapidAPI (403)"
-                        ) from None
-                    if attempt == 2:
-                        raise DownloadError(f"YouTube ответил ошибкой {e.code}") from None
-                except OSError:
-                    if attempt == 2:
-                        raise DownloadError("связь с YouTube оборвалась") from None
-                time.sleep(1)
-            f.write(part)
-            done += len(part)
-            if not size or not part:
-                break
-
-
-def _merge(video: Path, audio: Path, result: Path) -> None:
-    proc = subprocess.run(
-        ["ffmpeg", "-loglevel", "error", "-y", "-i", str(video), "-i", str(audio)]
-        + ["-c", "copy", "-movflags", "+faststart", str(result)],
-        capture_output=True,
-        text=True,
-        timeout=120,
-    )
-    video.unlink()
-    audio.unlink()
-    if proc.returncode != 0:
-        log.warning("ffmpeg failed: %s", proc.stderr[-300:])
-        raise DownloadError("не получилось склеить видео со звуком")
+    floor = min(MIN_QUALITY, picks[0]["quality"])  # у старых роликов 360p может и не быть
+    decent = [p for p in picks if p["quality"] >= floor]
+    fitting = [p for p in decent if p["size"] is None or p["size"] <= MAX_BYTES]
+    if not fitting:
+        smallest = decent[-1]
+        minutes = max(int(info.get("duration") or 0) // 60, 1)
+        raise DownloadError(
+            f"ролик идёт {minutes} мин и даже в {smallest['quality']}p весит "
+            f"{smallest['size'] // 1024 // 1024} МБ, а Telegram пропускает ботам не больше 50 МБ"
+        )
+    return fitting
 
 
 def download(url: str, out: Path) -> Media:
-    vid = video_id(url)
-    if not vid:
-        raise DownloadError("не понял ссылку — пришли ссылку на само видео")
-    data = _details(vid)
-    if data.get("isLiveNow"):
-        raise DownloadError("это прямой эфир, его скачать нельзя")
-    choice = _choose(data)
-    log.info("youtube %s: %dp, %d MB", vid, choice.quality, choice.size // 1024 // 1024)
+    try:
+        with yt_dlp.YoutubeDL(_opts(out, QUALITIES[0], False)) as ydl:
+            info = ydl.sanitize_info(ydl.extract_info(url, download=False) or {})
+        if info.get("_type", "video") != "video" or not info.get("formats"):
+            raise DownloadError("пришли ссылку на само видео, а не на плейлист или канал")
+        if info.get("is_live"):
+            raise DownloadError("это прямой эфир, его скачать нельзя")
 
-    result = out / f"{vid}.mp4"
-    if choice.audio:
-        video, audio = out / "video.part", out / "audio.part"
-        _get(choice.video["url"], video, _size(choice.video))
-        _get(choice.audio["url"], audio, _size(choice.audio))
-        _merge(video, audio, result)
-    else:
-        _get(choice.video["url"], result, _size(choice.video))
-    return Media(
-        files=[result],
-        caption=data.get("title") or None,
-        width=int(choice.video.get("width") or 0) or None,
-        height=int(choice.video.get("height") or 0) or None,
-        duration=int(data.get("lengthSeconds") or 0) or None,
-    )
+        # Размер до скачивания — оценка; если не угадали, берём качество пониже.
+        for choice in _choices(info):
+            for old in out.iterdir():
+                old.unlink()
+            log.info("youtube %s: trying %dp", info.get("id"), choice["quality"])
+            with yt_dlp.YoutubeDL(_opts(out, choice["limit"], choice["vertical"])) as ydl:
+                ydl.process_ie_result(copy.deepcopy(info), download=True)
+            files = [p for p in out.iterdir() if p.suffix.lower() in (".mp4", ".webm", ".mkv")]
+            if files and files[0].stat().st_size <= MAX_BYTES:
+                return Media(
+                    files=files[:1],
+                    caption=info.get("title") or None,
+                    width=choice["width"] or None,
+                    height=choice["height"] or None,
+                    duration=int(info.get("duration") or 0) or None,
+                )
+        raise DownloadError("видео не влезает в лимит Telegram — 50 МБ")
+    except DownloadError:
+        raise
+    except Exception as e:  # noqa: BLE001
+        raise DownloadError(_explain(e)) from None

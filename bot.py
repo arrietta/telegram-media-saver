@@ -201,7 +201,6 @@ def main() -> None:
     if not BOT_TOKEN:
         raise SystemExit("Не задан BOT_TOKEN (см. .env.example)")
     bot = Bot(BOT_TOKEN)
-    log.info("RAPIDAPI_KEY is %s", "set" if os.getenv("RAPIDAPI_KEY") else "NOT set")
     if WEBHOOK_BASE:
         run_webhook(bot)
     else:

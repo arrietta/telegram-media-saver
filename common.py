@@ -1,7 +1,9 @@
 """Общее для всех загрузчиков."""
 
+import os
 import shutil
 import ssl
+import tempfile
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -16,6 +18,22 @@ BROWSER_UA = (
     "(KHTML, like Gecko) Chrome/130.0 Safari/537.36"
 )
 HAS_FFMPEG = shutil.which("ffmpeg") is not None
+
+
+def _prepare_cookies() -> str | None:
+    """yt-dlp перезаписывает файл cookies, а секретные файлы на хостинге
+    доступны только для чтения — поэтому работаем с копией."""
+    # /etc/secrets/cookies.txt — сюда Render кладёт Secret File с именем cookies.txt.
+    candidates = [os.getenv("COOKIES_FILE"), "/etc/secrets/cookies.txt", "cookies.txt"]
+    src = next((c for c in candidates if c and Path(c).is_file()), None)
+    if not src:
+        return None
+    dst = Path(tempfile.gettempdir()) / "tms_cookies.txt"
+    shutil.copyfile(src, dst)
+    return str(dst)
+
+
+COOKIES = _prepare_cookies()
 
 
 class DownloadError(Exception):

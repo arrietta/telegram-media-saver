@@ -8,12 +8,10 @@ import asyncio
 import contextlib
 import copy
 import json
-import os
 import re
 import shutil
 import subprocess
 import sys
-import tempfile
 import urllib.parse
 import urllib.request
 from pathlib import Path
@@ -21,7 +19,15 @@ from pathlib import Path
 import yt_dlp
 
 import youtube
-from common import BROWSER_UA, HAS_FFMPEG, MAX_BYTES, SSL_CONTEXT, DownloadError, Media
+from common import (
+    BROWSER_UA,
+    COOKIES,
+    HAS_FFMPEG,
+    MAX_BYTES,
+    SSL_CONTEXT,
+    DownloadError,
+    Media,
+)
 
 MAX_DURATION = 60 * 60  # секунд; более длинное видео всё равно не влезет в 50 МБ
 MAX_ITEMS = 10  # столько файлов помещается в один альбом Telegram
@@ -61,29 +67,8 @@ def browser_link(url: str) -> str | None:
     return youtube.browser_link(url) if YT_RE.match(url) else None
 
 
-def _prepare_cookies() -> str | None:
-    """yt-dlp перезаписывает файл cookies, а секретные файлы на хостинге
-    доступны только для чтения — поэтому работаем с копией."""
-    # /etc/secrets/cookies.txt — сюда Render кладёт Secret File с именем cookies.txt.
-    candidates = [os.getenv("COOKIES_FILE"), "/etc/secrets/cookies.txt", "cookies.txt"]
-    src = next((c for c in candidates if c and Path(c).is_file()), None)
-    if not src:
-        return None
-    dst = Path(tempfile.gettempdir()) / "tms_cookies.txt"
-    shutil.copyfile(src, dst)
-    return str(dst)
-
-
-COOKIES = _prepare_cookies()
-
-
 def _clean(error: object) -> str:
     text = ANSI_RE.sub("", str(error)).replace("ERROR: ", "").strip()
-    if "confirm you" in text and "not a bot" in text:
-        return (
-            "YouTube не пускает сервер без входа в аккаунт. Нужно задать на хостинге "
-            "переменную RAPIDAPI_KEY (см. README)."
-        )
     return text[:300] or "неизвестная ошибка"
 
 
@@ -103,9 +88,7 @@ def _clear(out: Path) -> None:
 
 def _ytdlp_opts(out: Path, height: int) -> dict:
     if HAS_FFMPEG:
-        # Сначала дорожка «только видео» + звук: иначе из-за сортировки по aac
-        # yt-dlp на YouTube всегда берёт готовый файл 360p вместо нужного качества.
-        fmt = f"bv[height<={height}]+ba/b[height<={height}]/bv*[height<={height}]+ba/b"
+        fmt = f"bv*[height<={height}]+ba/b[height<={height}]/b"
     else:
         # Без ffmpeg склеить видео и звук нечем — берём готовый файл похуже качеством.
         fmt = f"b[height<={height}]/b"
@@ -131,7 +114,7 @@ def _ytdlp_opts(out: Path, height: int) -> dict:
 
 
 def _ytdlp(url: str, out: Path) -> None:
-    with yt_dlp.YoutubeDL(_ytdlp_opts(out, 720)) as ydl:
+    with yt_dlp.YoutubeDL(_ytdlp_opts(out, 1080)) as ydl:
         info = ydl.sanitize_info(ydl.extract_info(url, download=False) or {})
     # Разбор страницы — самая медленная часть на слабом сервере, поэтому для
     # одиночного видео делаем его один раз и дальше качаем по готовым данным.
@@ -141,17 +124,11 @@ def _ytdlp(url: str, out: Path) -> None:
     if (info.get("duration") or 0) > MAX_DURATION:
         raise DownloadError("видео длиннее часа — в лимит Telegram (50 МБ) не влезет")
 
-    # На YouTube есть выбор качества: понижаем его, пока файл не влезет в лимит.
-    for height in (720, 480, 360) if YT_RE.match(url) else (1080,):
-        _clear(out)
-        with yt_dlp.YoutubeDL(_ytdlp_opts(out, height)) as ydl:
-            if single:
-                ydl.process_ie_result(copy.deepcopy(info), download=True)
-            else:
-                ydl.download([url])
-        files = _files(out)
-        if files and max(f.stat().st_size for f in files) <= MAX_BYTES:
-            return
+    with yt_dlp.YoutubeDL(_ytdlp_opts(out, 1080)) as ydl:
+        if single:
+            ydl.process_ie_result(copy.deepcopy(info), download=True)
+        else:
+            ydl.download([url])
 
 
 # ------------------------------------------------------------ gallery-dl
@@ -243,21 +220,6 @@ def _tikwm(url: str, out: Path) -> None:
 # --------------------------------------------------------------- YouTube
 
 
-def _youtube_video(url: str, out: Path) -> Media:
-    if youtube.API_KEY:
-        return youtube.download(url, out)
-    # Без ключа RapidAPI (например, при запуске на своём компьютере) — как раньше.
-    try:
-        _ytdlp(url, out)
-    except DownloadError:
-        raise
-    except Exception as e:  # noqa: BLE001
-        raise DownloadError(_clean(e)) from None
-    if not _files(out):
-        raise DownloadError("по ссылке не нашлось видео")
-    return Media(_files(out))
-
-
 def _find_key(node: object, key: str):
     if isinstance(node, dict):
         for k, v in node.items():
@@ -281,7 +243,7 @@ def _youtube_post(url: str, out: Path) -> Media:
 
     video_id = next(_find_key(attachment, "videoId"), None)
     if video_id:
-        return _youtube_video(f"https://www.youtube.com/watch?v={video_id}", out)
+        return youtube.download(f"https://www.youtube.com/watch?v={video_id}", out)
 
     images = list(_find_key(attachment, "backstageImageRenderer"))[:MAX_ITEMS]
     if not images:
@@ -297,7 +259,7 @@ def _youtube_post(url: str, out: Path) -> Media:
 
 def _youtube(url: str, out: Path) -> Media:
     try:
-        return _youtube_post(url, out) if YT_POST_RE.search(url) else _youtube_video(url, out)
+        return _youtube_post(url, out) if YT_POST_RE.search(url) else youtube.download(url, out)
     except DownloadError:
         raise
     except Exception as e:  # noqa: BLE001

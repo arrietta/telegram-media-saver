@@ -7,6 +7,3 @@ services:
     envVars:
       - key: BOT_TOKEN
         sync: false
-      # Необязательно: ключ RapidAPI (YouTube Media Downloader) — запасной путь для YouTube.
-      - key: RAPIDAPI_KEY
-        sync: false
