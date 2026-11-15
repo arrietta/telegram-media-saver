@@ -39,6 +39,15 @@ def _prepare_cookies() -> str | None:
 COOKIES = _prepare_cookies()
 
 
+def has_cookies_for(domain: str) -> bool:
+    """Есть ли в cookies.txt записи для сайта. Смотрим только колонку с доменом:
+    файл общий для всех сайтов, и вход в Instagram ничего не даёт на YouTube."""
+    if not COOKIES:
+        return False
+    with open(COOKIES, encoding="utf-8", errors="replace") as f:
+        return any(domain in line.split("\t", 1)[0] for line in f if "\t" in line)
+
+
 class DownloadError(Exception):
     """Ошибка с текстом, который можно показать пользователю."""
 

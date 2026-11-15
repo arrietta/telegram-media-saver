@@ -17,7 +17,15 @@ from pathlib import Path
 import yt_dlp
 
 import warp
-from common import COOKIES, HAS_FFMPEG, MAX_BYTES, PROXY_URL, DownloadError, Media
+from common import (
+    COOKIES,
+    HAS_FFMPEG,
+    MAX_BYTES,
+    PROXY_URL,
+    DownloadError,
+    Media,
+    has_cookies_for,
+)
 
 log = logging.getLogger("youtube")
 
@@ -63,10 +71,13 @@ def _opts(out: Path, quality: int, vertical: bool, proxy: str | None) -> dict:
 def _explain(error: object) -> str:
     text = ANSI_RE.sub("", str(error)).replace("ERROR: ", "").strip()
     if "confirm you" in text and "not a bot" in text:
+        # Проверено на Render: YouTube отказывает и напрямую, и через WARP, с любым
+        # «клиентом» yt-dlp. Бесплатно помогает только вход в аккаунт (cookies).
         return "YouTube не пускает сервер без входа в аккаунт — " + (
-            "cookies.txt не помог; помогает платный прокси (переменная PROXY_URL, см. README)"
-            if COOKIES
-            else "помогает платный прокси (переменная PROXY_URL, см. README)"
+            "cookies.txt с входом в YouTube не помог (возможно, устарел); "
+            "помогает платный прокси (переменная PROXY_URL, см. README)"
+            if has_cookies_for("youtube.com")
+            else "владельцу нужно добавить в cookies.txt на хостинге вход в YouTube (см. README)"
         )
     return text[:300] or "неизвестная ошибка"
 
