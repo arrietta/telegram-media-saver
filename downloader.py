@@ -71,6 +71,11 @@ def browser_link(url: str) -> str | None:
 
 def _clean(error: object) -> str:
     text = ANSI_RE.sub("", str(error)).replace("ERROR: ", "").strip()
+    if "[Instagram]" in text and "empty media response" in text:
+        return (
+            "этот пост Instagram показывает только тем, кто вошёл в аккаунт. Чтобы бот мог "
+            "такие качать, владельцу нужно добавить на хостинг cookies.txt с входом в Instagram."
+        )
     if "[Instagram]" in text and ("rate-limit" in text or "Failed to parse JSON" in text):
         return "Instagram временно не отвечает серверу — слишком много запросов без входа. Попробуй через несколько минут."
     return text[:300] or "неизвестная ошибка"
@@ -353,7 +358,8 @@ def _download_sync(url: str, out: Path) -> Media:
             "в аккаунт, по ссылке они не скачиваются. Обычные видео и фото-посты работают."
         )
     if is_instagram and not COOKIES:
-        text = f"{text} С файлом cookies.txt на хостинге Instagram работает надёжнее."
+        if "cookies.txt" not in text:
+            text = f"{text} С файлом cookies.txt на хостинге Instagram работает надёжнее."
     raise DownloadError(text)
 
 
