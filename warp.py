@@ -21,7 +21,10 @@ import yt_dlp
 log = logging.getLogger("warp")
 
 PORT = 40000
-PROXY = f"socks5h://127.0.0.1:{PORT}"
+# socks5, а не socks5h: имена сайтов разрешает сам бот и отдаёт прокси готовый
+# IPv4-адрес. Иначе туннель выходит наружу по IPv6, а таким адресам YouTube
+# доверяет меньше всего.
+PROXY = f"socks5://127.0.0.1:{PORT}"
 TRACE_URL = "https://www.cloudflare.com/cdn-cgi/trace"
 
 _process: subprocess.Popen | None = None
