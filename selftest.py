@@ -48,7 +48,7 @@ def _run() -> None:
             tmp = Path(tempfile.mkdtemp(prefix="selftest_"))
             opts = {
                 "outtmpl": str(tmp / "v.%(ext)s"),
-                "format": "worst",
+                "format": "wv*/w",
                 "quiet": True,
                 "no_warnings": True,
                 "noprogress": True,
@@ -62,14 +62,20 @@ def _run() -> None:
             if client:
                 opts["extractor_args"] = {"youtube": {"player_client": [client]}}
             name = f"{route}/{client or 'default'}"
+            stage = "info"
             try:
                 with yt_dlp.YoutubeDL(opts) as ydl:
-                    info = ydl.extract_info(VIDEO, download=True)
+                    info = ydl.sanitize_info(ydl.extract_info(VIDEO, download=False))
+                    formats = len(info.get("formats") or [])
+                    stage = f"download ({formats} formats)"
+                    ydl.process_ie_result(info, download=True)
                 size = sum(p.stat().st_size for p in tmp.iterdir())
-                log.info("SELFTEST %s: OK, %d formats, %d bytes", name, len(info["formats"]), size)
+                log.info("SELFTEST %s: OK, %d formats, %d bytes", name, formats, size)
                 ok.append(name)
             except Exception as e:  # noqa: BLE001
-                log.info("SELFTEST %s: FAIL %s", name, str(e).replace("ERROR: ", "")[:110])
+                log.info(
+                    "SELFTEST %s: FAIL at %s: %s", name, stage, str(e).replace("ERROR: ", "")[:110]
+                )
             finally:
                 shutil.rmtree(tmp, ignore_errors=True)
     log.info("SELFTEST DONE, working: %s", ", ".join(ok) or "none")
