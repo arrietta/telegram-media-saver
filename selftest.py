@@ -1,16 +1,15 @@
-"""ВРЕМЕННО: при запуске проверяет, как сервер Invidious отдаёт куски файла
-с этого хостинга — напрямую и через WARP, кусками разного размера."""
+"""ВРЕМЕННО: при запуске качает один длинный ролик через Invidious и пишет
+в лог, удалась ли загрузка и склейка. После проверки файл удаляется."""
 
 import logging
+import shutil
+import tempfile
 import threading
 import time
+from pathlib import Path
 
-import yt_dlp
-from yt_dlp.networking import Request
-
-import invidious
 import warp
-from common import BROWSER_UA
+import youtube
 
 log = logging.getLogger("selftest")
 
@@ -20,31 +19,21 @@ def _run() -> None:
         if warp.proxy():
             break
         time.sleep(3)
-    try:
-        data = invidious.info("Haa0V072Prg")
-    except Exception as e:  # noqa: BLE001
-        log.info("SELFTEST info FAIL %s", e)
-        return
-    pick = [p for p in data["picks"] if p["quality"] == 320][0]
-    routes = {"direct": None}
-    if warp.proxy():
-        routes["warp"] = warp.PROXY
-    for name, proxy in routes.items():
-        opts = {"quiet": True, "socket_timeout": 30}
-        if proxy:
-            opts["proxy"] = proxy
-        with yt_dlp.YoutubeDL(opts) as ydl:
-            for kind in ("audio", "video"):
-                for size in (256 * 1024, 1024 * 1024, 4 * 1024 * 1024, 8 * 1024 * 1024):
-                    for attempt in (1, 2):
-                        started = time.time()
-                        try:
-                            req = Request(pick[kind], headers={"User-Agent": BROWSER_UA, "Range": f"bytes=0-{size - 1}"})
-                            got = len(ydl.urlopen(req).read())
-                            result = f"OK {got} bytes" if got == size else f"SHORT {got} bytes"
-                        except Exception as e:  # noqa: BLE001
-                            result = f"FAIL {str(e)[:70]}"
-                        log.info("SELFTEST %s %s %dK #%d: %s, %.1fs", name, kind, size // 1024, attempt, result, time.time() - started)
+    for video_id, quality in (("Haa0V072Prg", None), ("Haa0V072Prg", 320), ("jNQXAC9IVRw", None)):
+        tmp = Path(tempfile.mkdtemp(prefix="selftest_"))
+        started = time.time()
+        try:
+            media = youtube._via_invidious(video_id, tmp, quality)
+            f = media.files[0]
+            log.info(
+                "SELFTEST %s q=%s: OK %d bytes, %sx%s, quality=%s, menu=%s, probe=%s, %.0fs",
+                video_id, quality, f.stat().st_size, media.width, media.height, media.quality,
+                media.qualities, youtube._probe(f), time.time() - started,
+            )
+        except Exception as e:  # noqa: BLE001
+            log.info("SELFTEST %s q=%s: FAIL %s: %s, %.0fs", video_id, quality, type(e).__name__, e, time.time() - started)
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
     log.info("SELFTEST DONE")
 
 

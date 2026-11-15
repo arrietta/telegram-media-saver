@@ -15,14 +15,17 @@ import os
 import subprocess
 import time
 import urllib.parse
-import urllib.request
 from pathlib import Path
+
+import yt_dlp
+from yt_dlp.networking import Request
+
+import warp
 
 from common import (
     BROWSER_UA,
     HAS_FFMPEG,
     MAX_BYTES,
-    SSL_CONTEXT,
     DownloadError,
     TooBig,
     open_url,
@@ -35,8 +38,9 @@ DIRECTORY = "https://api.invidious.io/instances.json?sort_by=type,health"
 # На случай, если каталог недоступен: сервер с открытым API на момент написания.
 FALLBACK = ["yt.chocolatemoo53.com"]
 MAX_INSTANCES = 3
-CHUNK = 8 * 1024 * 1024
-CHUNK_RETRIES = 4
+CHUNK_WARP = 4 * 1024 * 1024
+CHUNK_DIRECT = 1024 * 1024
+MAX_FAILURES = 6  # на весь файл
 
 _cache: tuple[float, list[str]] = (0.0, [])
 
@@ -128,32 +132,45 @@ def info(video_id: str) -> dict:
 
 
 def _save_in_parts(url: str, path: Path, total: int, limit: int) -> Path:
-    """Качает файл кусками с повторами. Сервер Invidious — посредник между нами
-    и YouTube, и на длинной передаче он нередко обрывает связь (502); при загрузке
-    кусками обрыв стоит одного повторного запроса, а не всего файла."""
+    """Качает файл кусками с повторами.
+
+    Проверено на Render: напрямую сервер Invidious отдаёт хостингу только мелкие
+    куски (до 1 МБ), а на крупных рвёт связь или отвечает 502. Через WARP проходят
+    любые. Поэтому идём через WARP кусками по 4 МБ, а если его нет или он
+    подвёл — напрямую по 1 МБ."""
     if total > limit:
         raise TooBig
-    with path.open("wb") as f:
-        start = 0
-        while start < total:
-            end = min(start + CHUNK, total) - 1
-            for attempt in range(CHUNK_RETRIES):
+    routes = [(warp.proxy(), CHUNK_WARP)] if warp.proxy() else []
+    routes.append((None, CHUNK_DIRECT))
+    clients = [
+        (yt_dlp.YoutubeDL({"quiet": True, "socket_timeout": 30, **({"proxy": proxy} if proxy else {})}), size)
+        for proxy, size in routes
+    ]
+    try:
+        with path.open("wb") as f:
+            start = 0
+            failures = 0
+            while start < total:
+                # После сбоя пробуем другой путь; мелкий кусок не страшен ни одному.
+                client, size = clients[failures % len(clients)]
+                end = min(start + size, total) - 1
                 try:
-                    req = urllib.request.Request(
-                        url, headers={"User-Agent": BROWSER_UA, "Range": f"bytes={start}-{end}"}
-                    )
-                    with urllib.request.urlopen(req, timeout=40, context=SSL_CONTEXT) as resp:
-                        data = resp.read()
+                    req = Request(url, headers={"User-Agent": BROWSER_UA, "Range": f"bytes={start}-{end}"})
+                    data = client.urlopen(req).read()
                     if len(data) != end - start + 1:
                         raise RuntimeError(f"кусок {len(data)} байт вместо {end - start + 1}")
-                    break
                 except Exception as e:  # noqa: BLE001
-                    if attempt == CHUNK_RETRIES - 1:
+                    failures += 1
+                    if failures > MAX_FAILURES:
                         raise RuntimeError(f"{str(e)[:80]} на {start * 100 // total}%") from None
                     log.info("invidious: chunk at %d%% failed (%s), retrying", start * 100 // total, str(e)[:60])
-                    time.sleep(1 + attempt * 2)
-            f.write(data)
-            start = end + 1
+                    time.sleep(1)
+                    continue
+                f.write(data)
+                start = end + 1
+    finally:
+        for client, _ in clients:
+            client.close()
     return path
 
 
