@@ -25,7 +25,7 @@ from aiogram.types import (
 )
 from aiogram.utils.chat_action import ChatActionSender
 from aiogram.webhook.aiohttp_server import SimpleRequestHandler, setup_application
-from aiohttp import web
+from aiohttp import ClientSession, ClientTimeout, web
 from dotenv import load_dotenv
 
 load_dotenv()
@@ -55,6 +55,7 @@ MAX_PHOTO_BYTES = 10 * 1024 * 1024  # лимит Telegram на фото
 MAX_URLS_PER_MESSAGE = 3
 UPLOAD_TIMEOUT = 300
 DOWNLOAD_TIMEOUT = 240
+KEEP_AWAKE_INTERVAL = 600
 
 dp = Dispatcher()
 # На бесплатном тарифе мало памяти и CPU — не качаем больше двух ссылок сразу.
@@ -189,8 +190,24 @@ def run_webhook(bot: Bot) -> None:
     async def health(_: web.Request) -> web.Response:
         return web.Response(text="ok")
 
+    async def keep_awake(_: web.Application):
+        # Бесплатный Render усыпляет сервис через 15 минут без входящих запросов.
+        # Раз в 10 минут обращаемся к себе по внешнему адресу, чтобы этого не было.
+        async def ping() -> None:
+            async with ClientSession(timeout=ClientTimeout(total=30)) as session:
+                while True:
+                    await asyncio.sleep(KEEP_AWAKE_INTERVAL)
+                    with contextlib.suppress(Exception):
+                        async with session.get(WEBHOOK_BASE + "/"):
+                            pass
+
+        task = asyncio.create_task(ping())
+        yield
+        task.cancel()
+
     dp.startup.register(set_webhook)
     app = web.Application()
+    app.cleanup_ctx.append(keep_awake)
     app.router.add_get("/", health)
     SimpleRequestHandler(dp, bot, secret_token=WEBHOOK_SECRET).register(app, path=WEBHOOK_PATH)
     setup_application(app, dp, bot=bot)
