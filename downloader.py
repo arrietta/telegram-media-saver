@@ -25,6 +25,7 @@ from common import (
     COOKIES,
     HAS_FFMPEG,
     MAX_BYTES,
+    PROXY_URL,
     SSL_CONTEXT,
     DownloadError,
     Media,
@@ -230,16 +231,19 @@ def _instagram_public(url: str, out: Path) -> None:
     opts = _ytdlp_opts(out, 1080)
     opts.pop("cookiefile", None)  # устаревшие cookies только мешают
     opts["ignore_no_formats_error"] = True
-    try:
-        with yt_dlp.YoutubeDL(opts) as ydl:
-            info = ydl.sanitize_info(ydl.extract_info(url, download=False) or {})
-    except Exception:
-        # Instagram быстро ограничивает адреса хостингов — пробуем с адреса WARP.
-        if not warp.proxy():
-            raise
-        opts["proxy"] = warp.proxy()
-        with yt_dlp.YoutubeDL(opts) as ydl:
-            info = ydl.sanitize_info(ydl.extract_info(url, download=False) or {})
+    # Instagram быстро ограничивает адреса хостингов — тогда пробуем с других адресов.
+    routes = [None] + [p for p in (warp.proxy(), PROXY_URL) if p]
+    for i, proxy in enumerate(routes):
+        opts["proxy"] = proxy
+        try:
+            with yt_dlp.YoutubeDL(opts) as ydl:
+                info = ydl.sanitize_info(ydl.extract_info(url, download=False) or {})
+            break
+        except Exception:
+            if i == len(routes) - 1:
+                raise
+    # Сами файлы лежат на отдельных серверах без ограничений — качаем их напрямую.
+    opts["proxy"] = None
     entries = info.get("entries") or [] if info.get("_type") == "playlist" else [info]
     for i, entry in enumerate([e for e in entries if e][:MAX_ITEMS], 1):
         if entry.get("formats"):

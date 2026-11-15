@@ -17,7 +17,7 @@ from pathlib import Path
 import yt_dlp
 
 import warp
-from common import COOKIES, HAS_FFMPEG, MAX_BYTES, DownloadError, Media
+from common import COOKIES, HAS_FFMPEG, MAX_BYTES, PROXY_URL, DownloadError, Media
 
 log = logging.getLogger("youtube")
 
@@ -64,9 +64,9 @@ def _explain(error: object) -> str:
     text = ANSI_RE.sub("", str(error)).replace("ERROR: ", "").strip()
     if "confirm you" in text and "not a bot" in text:
         return "YouTube не пускает сервер без входа в аккаунт — " + (
-            "файл cookies.txt на хостинге устарел, его нужно обновить (см. README)"
+            "cookies.txt не помог; помогает платный прокси (переменная PROXY_URL, см. README)"
             if COOKIES
-            else "на хостинг нужно добавить файл cookies.txt (см. README)"
+            else "помогает платный прокси (переменная PROXY_URL, см. README)"
         )
     return text[:300] or "неизвестная ошибка"
 
@@ -115,15 +115,16 @@ def _choices(info: dict) -> list[dict]:
 
 
 def download(url: str, out: Path) -> Media:
-    # Сначала через WARP, потом напрямую. Ошибку показываем от последней попытки.
-    routes = [p for p in (warp.proxy(),) if p] + [None]
-    for proxy in routes:
+    # Маршруты от бесплатного к платному: WARP, напрямую (с cookies), свой прокси.
+    # Ошибку показываем от последней попытки.
+    routes = [p for p in (warp.proxy(),) if p] + [None] + [p for p in (PROXY_URL,) if p]
+    for i, proxy in enumerate(routes):
         try:
             return _download(url, out, proxy)
         except DownloadError as e:
-            if proxy is None or not e.retry:
+            if i == len(routes) - 1 or not e.retry:
                 raise
-            log.info("youtube via WARP failed (%s), trying directly", e)
+            log.info("youtube route %d failed (%s), trying the next one", i + 1, e)
     raise AssertionError("unreachable")
 
 
@@ -141,7 +142,10 @@ def _download(url: str, out: Path, proxy: str | None) -> Media:
             for old in out.iterdir():
                 old.unlink()
             log.info(
-                "youtube %s: %dp via %s", info.get("id"), choice["quality"], "WARP" if proxy else "direct"
+                "youtube %s: %dp via %s",
+                info.get("id"),
+                choice["quality"],
+                "WARP" if proxy == warp.PROXY else "proxy" if proxy else "direct",
             )
             with yt_dlp.YoutubeDL(_opts(out, choice["limit"], choice["vertical"], proxy)) as ydl:
                 ydl.process_ie_result(copy.deepcopy(info), download=True)

@@ -18,6 +18,9 @@ BROWSER_UA = (
     "(KHTML, like Gecko) Chrome/130.0 Safari/537.36"
 )
 HAS_FFMPEG = shutil.which("ffmpeg") is not None
+# Необязательный платный прокси с «домашними» адресами (http://user:pass@host:port):
+# через него идут только запросы, которым сайт отказал напрямую.
+PROXY_URL = (os.getenv("PROXY_URL") or "").strip() or None
 
 
 def _prepare_cookies() -> str | None:
