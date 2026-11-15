@@ -18,6 +18,7 @@ from pathlib import Path
 
 import yt_dlp
 
+import warp
 import youtube
 from common import (
     BROWSER_UA,
@@ -69,6 +70,8 @@ def browser_link(url: str) -> str | None:
 
 def _clean(error: object) -> str:
     text = ANSI_RE.sub("", str(error)).replace("ERROR: ", "").strip()
+    if "[Instagram]" in text and ("rate-limit" in text or "Failed to parse JSON" in text):
+        return "Instagram временно не отвечает серверу — слишком много запросов без входа. Попробуй через несколько минут."
     return text[:300] or "неизвестная ошибка"
 
 
@@ -217,6 +220,37 @@ def _tikwm(url: str, out: Path) -> None:
     _save(full(video), out / f"01_{data.get('id', 'tiktok')}.mp4")
 
 
+# ------------------------------------------------------------- Instagram
+
+
+def _instagram_public(url: str, out: Path) -> None:
+    """Запасной путь для Instagram без входа в аккаунт: фото и карусели.
+    yt-dlp умеет качать только видео, но в данных поста, которые он получает
+    без входа, есть и адреса фотографий — берём их оттуда."""
+    opts = _ytdlp_opts(out, 1080)
+    opts.pop("cookiefile", None)  # устаревшие cookies только мешают
+    opts["ignore_no_formats_error"] = True
+    try:
+        with yt_dlp.YoutubeDL(opts) as ydl:
+            info = ydl.sanitize_info(ydl.extract_info(url, download=False) or {})
+    except Exception:
+        # Instagram быстро ограничивает адреса хостингов — пробуем с адреса WARP.
+        if not warp.proxy():
+            raise
+        opts["proxy"] = warp.proxy()
+        with yt_dlp.YoutubeDL(opts) as ydl:
+            info = ydl.sanitize_info(ydl.extract_info(url, download=False) or {})
+    entries = info.get("entries") or [] if info.get("_type") == "playlist" else [info]
+    for i, entry in enumerate([e for e in entries if e][:MAX_ITEMS], 1):
+        if entry.get("formats"):
+            video = dict(opts, outtmpl=str(out / f"{i:02d}_%(id)s.%(ext)s"))
+            with yt_dlp.YoutubeDL(video) as ydl:
+                ydl.process_ie_result(copy.deepcopy(entry), download=True)
+        elif entry.get("thumbnail"):
+            # У фото «превью» — это и есть сама фотография в полном размере.
+            _save(entry["thumbnail"], out / f"{i:02d}.jpg")
+
+
 # --------------------------------------------------------------- YouTube
 
 
@@ -284,8 +318,11 @@ def _download_sync(url: str, out: Path) -> Media:
         steps.append(_tikwm)
     is_instagram = "instagram.com" in url.lower()
     if is_instagram and not COOKIES:
-        # Без входа gallery-dl с Instagram не работает вообще — не тратим на него время.
-        steps = [_ytdlp]
+        # Без входа gallery-dl с Instagram не работает вообще, а анонимных запросов
+        # Instagram даёт мало — поэтому один шаг, который берёт и видео, и фото.
+        steps = [_instagram_public]
+    elif is_instagram:
+        steps.append(_instagram_public)
     errors: list[str] = []
     for step in steps:
         _clear(out)
@@ -304,7 +341,7 @@ def _download_sync(url: str, out: Path) -> Media:
         if files:
             return Media(files)
     # Показываем ошибку yt-dlp — она обычно самая понятная.
-    main = errors[steps.index(_ytdlp)] if len(errors) == len(steps) else None
+    main = errors[steps.index(_ytdlp)] if _ytdlp in steps and len(errors) == len(steps) else None
     text = main or (errors[0] if errors else "по ссылке не нашлось медиа")
     if is_tiktok and TIKTOK_STORY_RE.search(url):
         text = (
@@ -312,7 +349,7 @@ def _download_sync(url: str, out: Path) -> Media:
             "в аккаунт, по ссылке они не скачиваются. Обычные видео и фото-посты работают."
         )
     if is_instagram and not COOKIES:
-        text = f"Instagram не отдаёт это серверу без входа в аккаунт (нужен cookies.txt). {text}"
+        text = f"{text} С файлом cookies.txt на хостинге Instagram работает надёжнее."
     raise DownloadError(text)
 
 
