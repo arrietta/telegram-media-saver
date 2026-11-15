@@ -73,10 +73,9 @@ def browser_link(url: str) -> str | None:
 def _clean(error: object) -> str:
     text = ANSI_RE.sub("", str(error)).replace("ERROR: ", "").strip()
     if "[Instagram]" in text and "empty media response" in text:
-        return (
-            "Instagram показывает этот пост только вошедшим в аккаунт — так бывает у закрытых "
-            "профилей и постов с ограничением по возрасту. Такие бот скачать не может."
-        )
+        # Проверено: у таких постов Instagram и гостю в браузере пишет «контент
+        # недоступен», и сторонние сервисы (cobalt) возвращают пустой ответ.
+        return "автор ограничил просмотр этого поста (профиль 18+ или закрытый) — без входа в Instagram его не скачать."
     if "[Instagram]" in text and ("rate-limit" in text or "Failed to parse JSON" in text):
         return "Instagram временно не отвечает серверу — слишком много запросов без входа. Попробуй через несколько минут."
     return text[:300] or "неизвестная ошибка"
