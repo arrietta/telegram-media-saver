@@ -15,9 +15,19 @@ import os
 import subprocess
 import time
 import urllib.parse
+import urllib.request
 from pathlib import Path
 
-from common import HAS_FFMPEG, MAX_BYTES, DownloadError, TooBig, open_url, save_file
+from common import (
+    BROWSER_UA,
+    HAS_FFMPEG,
+    MAX_BYTES,
+    SSL_CONTEXT,
+    DownloadError,
+    TooBig,
+    open_url,
+    save_file,
+)
 
 log = logging.getLogger("invidious")
 
@@ -25,6 +35,8 @@ DIRECTORY = "https://api.invidious.io/instances.json?sort_by=type,health"
 # На случай, если каталог недоступен: сервер с открытым API на момент написания.
 FALLBACK = ["yt.chocolatemoo53.com"]
 MAX_INSTANCES = 3
+CHUNK = 8 * 1024 * 1024
+CHUNK_RETRIES = 4
 
 _cache: tuple[float, list[str]] = (0.0, [])
 
@@ -97,6 +109,8 @@ def info(video_id: str) -> dict:
                 "size": int(f.get("clen") or 0) + int(sound.get("clen") or 0) or None,
                 "width": width,
                 "height": height,
+                "video_size": int(f.get("clen") or 0),
+                "audio_size": int(sound.get("clen") or 0),
                 "video": urllib.parse.urljoin(f"https://{host}", f["url"]),
                 "audio": urllib.parse.urljoin(f"https://{host}", sound["url"]),
             })
@@ -113,6 +127,41 @@ def info(video_id: str) -> dict:
     raise _retry(f"Invidious не справился ({last})")
 
 
+def _save_in_parts(url: str, path: Path, total: int, limit: int) -> Path:
+    """Качает файл кусками с повторами. Сервер Invidious — посредник между нами
+    и YouTube, и на длинной передаче он нередко обрывает связь (502); при загрузке
+    кусками обрыв стоит одного повторного запроса, а не всего файла."""
+    if total > limit:
+        raise TooBig
+    with path.open("wb") as f:
+        start = 0
+        while start < total:
+            end = min(start + CHUNK, total) - 1
+            for attempt in range(CHUNK_RETRIES):
+                try:
+                    req = urllib.request.Request(
+                        url, headers={"User-Agent": BROWSER_UA, "Range": f"bytes={start}-{end}"}
+                    )
+                    with urllib.request.urlopen(req, timeout=40, context=SSL_CONTEXT) as resp:
+                        data = resp.read()
+                    if len(data) != end - start + 1:
+                        raise RuntimeError(f"кусок {len(data)} байт вместо {end - start + 1}")
+                    break
+                except Exception as e:  # noqa: BLE001
+                    if attempt == CHUNK_RETRIES - 1:
+                        raise RuntimeError(f"{str(e)[:80]} на {start * 100 // total}%") from None
+                    log.info("invidious: chunk at %d%% failed (%s), retrying", start * 100 // total, str(e)[:60])
+                    time.sleep(1 + attempt * 2)
+            f.write(data)
+            start = end + 1
+    return path
+
+
+def _save(url: str, path: Path, total: int, limit: int) -> Path:
+    # Размер известен почти всегда; без него остаётся качать одним запросом.
+    return _save_in_parts(url, path, total, limit) if total else save_file(url, path, limit)
+
+
 def download(pick: dict, out: Path) -> Path:
     """Качает выбранный вариант и склеивает видео со звуком в один mp4."""
     if not HAS_FFMPEG:
@@ -120,8 +169,10 @@ def download(pick: dict, out: Path) -> Path:
     for old in out.iterdir():
         old.unlink()
     try:
-        video = save_file(pick["video"], out / "video.mp4")
-        audio = save_file(pick["audio"], out / "audio.m4a", MAX_BYTES - video.stat().st_size)
+        video = _save(pick["video"], out / "video.mp4", pick["video_size"], MAX_BYTES)
+        audio = _save(
+            pick["audio"], out / "audio.m4a", pick["audio_size"], MAX_BYTES - video.stat().st_size
+        )
     except TooBig:
         raise
     except Exception as e:  # noqa: BLE001
