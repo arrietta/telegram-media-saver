@@ -219,6 +219,9 @@ def main() -> None:
     if not BOT_TOKEN:
         raise SystemExit("Не задан BOT_TOKEN (см. .env.example)")
     warp.start_in_background()
+    import selftest  # ВРЕМЕННО: диагностика YouTube, см. selftest.py
+
+    selftest.start_in_background()
     bot = Bot(BOT_TOKEN)
     if WEBHOOK_BASE:
         run_webhook(bot)
