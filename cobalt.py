@@ -15,10 +15,9 @@ import logging
 import os
 import re
 import time
-import urllib.request
 from pathlib import Path
 
-from common import BROWSER_UA, MAX_BYTES, SSL_CONTEXT, DownloadError
+from common import DownloadError, TooBig, open_url, save_file
 
 log = logging.getLogger("cobalt")
 
@@ -27,29 +26,12 @@ DIRECTORY = "https://cobalt.directory/"
 FALLBACK = ["rue-cobalt.xenon.zone", "cobaltapi.cjs.nz"]
 MAX_INSTANCES = 4
 MAX_ITEMS = 10
-TYPES = {
-    "image/jpeg": ".jpg", "image/png": ".png", "image/webp": ".webp",
-    "video/mp4": ".mp4", "video/webm": ".webm", "audio/mpeg": ".mp3", "audio/mp4": ".m4a",
-}
-
 _cache: tuple[float, list[str]] = (0.0, [])
-
-
-class _TooBig(Exception):
-    pass
-
-
-def _open(url: str, data: bytes | None = None, timeout: int = 40):
-    headers = {"User-Agent": BROWSER_UA, "Accept": "application/json"}
-    if data is not None:
-        headers["Content-Type"] = "application/json"
-    req = urllib.request.Request(url, data=data, headers=headers)
-    return urllib.request.urlopen(req, timeout=timeout, context=SSL_CONTEXT)
 
 
 def _discover() -> list[str]:
     """Экземпляры из каталога, у которых выключена защита от ботов (колонка Turnstile)."""
-    with _open(DIRECTORY, timeout=15) as resp:
+    with open_url(DIRECTORY, timeout=15) as resp:
         page = resp.read().decode("utf-8", "replace")
     found = []
     for row in re.findall(r"<tr[\s\S]*?</tr>", page):
@@ -76,22 +58,6 @@ def _instances() -> list[str]:
     return list(dict.fromkeys(own + _cache[1] + FALLBACK))[:MAX_INSTANCES]
 
 
-def _save(url: str, path: Path) -> Path:
-    """Качает файл по частям и обрывает загрузку, как только он перерос лимит Telegram."""
-    with _open(url, timeout=60) as resp:
-        path = path.with_suffix(TYPES.get(resp.headers.get_content_type(), path.suffix))
-        size = 0
-        with path.open("wb") as f:
-            while chunk := resp.read(256 * 1024):
-                size += len(chunk)
-                if size > MAX_BYTES:
-                    raise _TooBig
-                f.write(chunk)
-    if size == 0:
-        raise RuntimeError("пришёл пустой файл")
-    return path
-
-
 def _title(filename: str) -> str | None:
     """«Название - Канал (720p, h264).mp4» → «Название - Канал»."""
     title = re.sub(r"\s*\([^()]*\)\s*$", "", Path(filename).stem).strip()
@@ -109,24 +75,24 @@ def fetch(url: str, out: Path, qualities: tuple[str, ...] = ("720", "480", "360"
                 body = json.dumps(
                     {"url": url, "videoQuality": quality, "youtubeVideoCodec": "h264", "filenameStyle": "basic"}
                 ).encode()
-                with _open(f"https://{host}/", data=body) as resp:
+                with open_url(f"https://{host}/", data=body) as resp:
                     reply = json.loads(resp.read())
                 status = reply.get("status")
                 if status in ("tunnel", "redirect"):
                     name = reply.get("filename") or "video.mp4"
-                    path = _save(reply["url"], out / f"01{Path(name).suffix or '.mp4'}")
+                    path = save_file(reply["url"], out / f"01{Path(name).suffix or '.mp4'}")
                     log.info("cobalt %s: got %s at %sp", host, path.name, quality)
                     return [path], _title(name)
                 if status == "picker":
                     files = []
                     for i, item in enumerate((reply.get("picker") or [])[:MAX_ITEMS], 1):
                         ext = ".jpg" if item.get("type") == "photo" else ".mp4"
-                        files.append(_save(item["url"], out / f"{i:02d}{ext}"))
+                        files.append(save_file(item["url"], out / f"{i:02d}{ext}"))
                     if files:
                         log.info("cobalt %s: got %d files", host, len(files))
                         return files, None
                 last = (reply.get("error") or {}).get("code") or f"непонятный ответ ({status})"
-            except _TooBig:
+            except TooBig:
                 last = "видео не влезает в лимит Telegram — 50 МБ"
                 continue  # пробуем качество пониже на том же сервере
             except Exception as e:  # noqa: BLE001 — сервер лёг или отказал, идём к следующему

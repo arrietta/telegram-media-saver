@@ -4,7 +4,8 @@ import os
 import shutil
 import ssl
 import tempfile
-from dataclasses import dataclass
+import urllib.request
+from dataclasses import dataclass, field
 from pathlib import Path
 
 import certifi
@@ -55,3 +56,43 @@ class Media:
     width: int | None = None
     height: int | None = None
     duration: int | None = None
+    # Для YouTube: что отправили и что ещё можно запросить кнопками под видео.
+    video_id: str | None = None
+    quality: int | None = None
+    qualities: list[tuple[int, int | None]] = field(default_factory=list)  # (качество, байт)
+
+
+class TooBig(Exception):
+    """Файл перерос лимит Telegram — качать дальше нет смысла."""
+
+
+CONTENT_TYPES = {
+    "image/jpeg": ".jpg", "image/png": ".png", "image/webp": ".webp",
+    "video/mp4": ".mp4", "video/webm": ".webm", "audio/mpeg": ".mp3", "audio/mp4": ".m4a",
+}
+
+
+def open_url(url: str, data: bytes | None = None, timeout: int = 40):
+    """Запрос к стороннему сервису; data — тело POST в формате JSON."""
+    headers = {"User-Agent": BROWSER_UA, "Accept": "application/json"}
+    if data is not None:
+        headers["Content-Type"] = "application/json"
+    req = urllib.request.Request(url, data=data, headers=headers)
+    return urllib.request.urlopen(req, timeout=timeout, context=SSL_CONTEXT)
+
+
+def save_file(url: str, path: Path, limit: int = MAX_BYTES) -> Path:
+    """Качает файл по частям и обрывает загрузку, как только он перерос limit.
+    Расширение подбирает по типу содержимого."""
+    with open_url(url, timeout=60) as resp:
+        path = path.with_suffix(CONTENT_TYPES.get(resp.headers.get_content_type(), path.suffix))
+        size = 0
+        with path.open("wb") as f:
+            while chunk := resp.read(256 * 1024):
+                size += len(chunk)
+                if size > limit:
+                    raise TooBig
+                f.write(chunk)
+    if size == 0:
+        raise RuntimeError("пришёл пустой файл")
+    return path

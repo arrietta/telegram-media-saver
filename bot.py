@@ -9,6 +9,7 @@ import contextlib
 import hashlib
 import logging
 import os
+import re
 import shutil
 import tempfile
 from pathlib import Path
@@ -16,6 +17,7 @@ from pathlib import Path
 from aiogram import Bot, Dispatcher, F
 from aiogram.filters import CommandStart
 from aiogram.types import (
+    CallbackQuery,
     FSInputFile,
     InlineKeyboardButton,
     InlineKeyboardMarkup,
@@ -56,6 +58,7 @@ MAX_URLS_PER_MESSAGE = 3
 UPLOAD_TIMEOUT = 300
 DOWNLOAD_TIMEOUT = 240
 KEEP_AWAKE_INTERVAL = 600
+QUALITY_RE = re.compile(r"yt:([\w-]{11}):(\d{3,4})")
 
 dp = Dispatcher()
 # На бесплатном тарифе мало памяти и CPU — не качаем больше двух ссылок сразу.
@@ -82,13 +85,23 @@ async def on_message(message: Message) -> None:
         await handle_url(message, url)
 
 
-async def handle_url(message: Message, url: str) -> None:
-    log.info("got link %s", url)
-    status = await message.reply("⏳ Скачиваю…")
+@dp.callback_query(F.data.regexp(QUALITY_RE))
+async def on_quality(callback: CallbackQuery) -> None:
+    """Кнопка с другим качеством под YouTube-видео."""
+    video_id, quality = QUALITY_RE.fullmatch(callback.data).groups()
+    await callback.answer(f"Скачиваю в {quality}p…")
+    if isinstance(callback.message, Message):
+        url = f"https://www.youtube.com/watch?v={video_id}"
+        await handle_url(callback.message, url, int(quality))
+
+
+async def handle_url(message: Message, url: str, quality: int | None = None) -> None:
+    log.info("got link %s%s", url, f" at {quality}p" if quality else "")
+    status = await message.reply(f"⏳ Скачиваю в {quality}p…" if quality else "⏳ Скачиваю…")
     tmp = Path(tempfile.mkdtemp(prefix="tms_"))
     try:
         async with downloads:
-            media = await asyncio.wait_for(download(url, tmp), DOWNLOAD_TIMEOUT)
+            media = await asyncio.wait_for(download(url, tmp, quality), DOWNLOAD_TIMEOUT)
         log.info("downloaded %d file(s) for %s", len(media.files), url)
         with contextlib.suppress(Exception):
             await status.edit_text("📤 Отправляю…")
@@ -117,6 +130,22 @@ def browser_keyboard(url: str) -> InlineKeyboardMarkup | None:
     """Кнопка-запасной путь для YouTube: открыть ролик на ssyoutube.com."""
     link = browser_link(url)
     return InlineKeyboardMarkup(inline_keyboard=[[browser_button(link)]]) if link else None
+
+
+def quality_keyboard(media: Media) -> InlineKeyboardMarkup | None:
+    """Кнопки «другое качество» под YouTube-видео: только те варианты, что влезают в Telegram."""
+    if not media.video_id:
+        return None
+    buttons = [
+        InlineKeyboardButton(
+            text=f"{quality}p · {max(size // 1024 // 1024, 1)} МБ" if size else f"{quality}p",
+            callback_data=f"yt:{media.video_id}:{quality}",
+        )
+        for quality, size in media.qualities
+        if quality != media.quality
+    ]
+    rows = [buttons[i : i + 3] for i in range(0, len(buttons), 3)]
+    return InlineKeyboardMarkup(inline_keyboard=rows) if rows else None
 
 
 async def send_files(message: Message, media: Media) -> None:
@@ -170,6 +199,7 @@ async def send_one(message: Message, f: Path, media: Media) -> None:
             height=media.height,
             duration=media.duration,
             supports_streaming=True,
+            reply_markup=quality_keyboard(media),
             request_timeout=UPLOAD_TIMEOUT,
         )
     else:
@@ -184,7 +214,12 @@ async def run_polling(bot: Bot) -> None:
 
 def run_webhook(bot: Bot) -> None:
     async def set_webhook(bot: Bot) -> None:
-        await bot.set_webhook(WEBHOOK_BASE + WEBHOOK_PATH, secret_token=WEBHOOK_SECRET)
+        await bot.set_webhook(
+            WEBHOOK_BASE + WEBHOOK_PATH,
+            secret_token=WEBHOOK_SECRET,
+            # Без этого Telegram не присылает нажатия кнопок (callback_query).
+            allowed_updates=dp.resolve_used_update_types(),
+        )
         log.info("webhook set to %s%s", WEBHOOK_BASE, WEBHOOK_PATH)
 
     async def health(_: web.Request) -> web.Response:

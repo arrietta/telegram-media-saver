@@ -1,13 +1,15 @@
-"""YouTube: один простой путь.
+"""YouTube.
 
 Ссылка → лучшее качество до 720p, которое влезает в лимит Telegram → mp4
-с названием ролика в подписи. Разбирает и качает yt-dlp, видео со звуком
-склеивает ffmpeg без перекодирования.
+с названием ролика в подписи. Под видео бот показывает кнопки с другими
+качествами; по кнопке приходит то же видео в выбранном качестве.
 
-На хостинге YouTube не пускает адрес сервера («Sign in to confirm you're not
-a bot»), поэтому сначала идём через Cloudflare WARP (см. warp.py), а если он
-не поднялся или не помог — напрямую, а затем через сторонний сервис cobalt
-(см. cobalt.py), которому вход в аккаунт не нужен.
+Способы скачать, по порядку:
+1. Сам, через yt-dlp (WARP, затем напрямую). На хостинге YouTube отказывает
+   («Sign in to confirm you're not a bot») — тогда час к нему не обращаемся.
+2. Invidious (invidious.py) — знает точный список качеств, тянет длинные ролики.
+3. cobalt (cobalt.py) — запасной вариант; списка качеств не даёт.
+4. Свой платный прокси PROXY_URL, если задан.
 """
 
 import copy
@@ -15,11 +17,13 @@ import json
 import logging
 import re
 import subprocess
+import time
 from pathlib import Path
 
 import yt_dlp
 
 import cobalt
+import invidious
 import warp
 from common import (
     COOKIES,
@@ -28,12 +32,17 @@ from common import (
     PROXY_URL,
     DownloadError,
     Media,
+    TooBig,
 )
 
 log = logging.getLogger("youtube")
 
-QUALITIES = (720, 480, 360, 240, 144)  # выше 720p в чате разницы не видно, а файл тяжелее
-MIN_QUALITY = 360  # ниже — уже каша; лучше честно сказать, что видео не влезает
+QUALITIES = (1080, 720, 480, 360, 240, 144)
+DEFAULT_MAX = 720  # сами выше не берём: в чате разницы не видно, а файл тяжелее
+MIN_QUALITY = 360  # ниже — уже каша; сами такое не шлём, только по кнопке
+BLOCK_PAUSE = 3600  # столько секунд не ходим на YouTube сами после его отказа серверу
+
+_blocked_until = 0.0
 
 ID_RE = re.compile(r"(?:[?&]v=|youtu\.be/|/shorts/|/embed/|/live/)([\w-]{11})")
 ANSI_RE = re.compile(r"\x1b\[[0-9;]*m")
@@ -76,7 +85,7 @@ def _explain(error: object) -> str:
     if "confirm you" in text and "not a bot" in text:
         # Проверено на Render: YouTube отказывает и напрямую, и через WARP, с любым
         # «клиентом» yt-dlp — поэтому дальше идём в сторонний сервис (cobalt.py).
-        return "YouTube не отдаёт видео серверу, а запасной сервис сейчас не справился. Попробуй позже."
+        return "YouTube не отдаёт видео серверу, а запасные сервисы сейчас не справились. Попробуй позже."
     return text[:300] or "неизвестная ошибка"
 
 
@@ -98,29 +107,45 @@ def _pick(info: dict, quality: int, vertical: bool) -> dict | None:
     return {"quality": min(width, height) or height, "size": size, "width": width, "height": height}
 
 
-def _choices(info: dict) -> list[dict]:
-    """Варианты от лучшего к худшему, которые не стыдно отправить и которые
-    по оценке влезают в лимит Telegram."""
+def _picks(info: dict) -> list[dict]:
+    """Все качества ролика от лучшего к худшему — по данным yt-dlp."""
     vertical = (info.get("width") or 0) < (info.get("height") or 0)
     picks: list[dict] = []
     for quality in QUALITIES:
         pick = _pick(info, quality, vertical)
         if pick and pick["quality"] not in [p["quality"] for p in picks]:
             picks.append({**pick, "limit": quality, "vertical": vertical})
+    return picks
+
+
+def _plan(picks: list[dict], duration: int, wanted: int | None) -> tuple[list[dict], list[tuple[int, int | None]]]:
+    """Что качать (по порядку попыток) и что предложить кнопками.
+
+    wanted — качество, выбранное кнопкой; без него берём лучшее до 720p, которое
+    по оценке влезает в лимит Telegram."""
     if not picks:
         raise DownloadError("у этого видео нет подходящего формата")
+    fits = [p for p in picks if p["size"] is None or p["size"] <= MAX_BYTES]
+    menu = [(p["quality"], p["size"]) for p in fits]
+    if wanted:
+        chosen = [p for p in picks if p["quality"] == wanted]
+        if not chosen:
+            raise DownloadError(f"качества {wanted}p у этого ролика нет")
+        return chosen, menu
 
-    floor = min(MIN_QUALITY, picks[0]["quality"])  # у старых роликов 360p может и не быть
-    decent = [p for p in picks if p["quality"] >= floor]
+    # Свой потолок — 720p, но если у ролика есть только что-то выше, берём что есть.
+    usual = [p for p in picks if p["quality"] <= DEFAULT_MAX] or picks[-1:]
+    floor = min(MIN_QUALITY, usual[0]["quality"])  # у старых роликов 360p может и не быть
+    decent = [p for p in usual if p["quality"] >= floor]
     fitting = [p for p in decent if p["size"] is None or p["size"] <= MAX_BYTES]
     if not fitting:
         smallest = decent[-1]
-        minutes = max(int(info.get("duration") or 0) // 60, 1)
+        minutes = max(duration // 60, 1)
         raise DownloadError(
             f"ролик идёт {minutes} мин и даже в {smallest['quality']}p весит "
             f"{smallest['size'] // 1024 // 1024} МБ, а Telegram пропускает ботам не больше 50 МБ"
         )
-    return fitting
+    return fitting, menu
 
 
 def _probe(path: Path) -> dict:
@@ -143,31 +168,78 @@ def _probe(path: Path) -> dict:
         return {}
 
 
-def download(url: str, out: Path) -> Media:
-    # Маршруты от бесплатного к платному: WARP, напрямую, сторонний сервис cobalt,
-    # свой прокси. Если не вышло нигде, показываем отказ самого YouTube.
+def download(url: str, out: Path, quality: int | None = None) -> Media:
+    """quality — качество, выбранное кнопкой под видео (короткая сторона кадра)."""
+    global _blocked_until
+    match = ID_RE.search(url)
+    video_id = match.group(1) if match else None
     error: DownloadError | None = None
-    for i, proxy in enumerate([p for p in (warp.proxy(),) if p] + [None]):
+
+    # 1. Сами. После отказа «подтвердите, что вы не бот» час не пробуем: отказ
+    #    касается адреса сервера, а не ролика, и каждая попытка — лишние секунды.
+    if time.time() >= _blocked_until:
+        for i, proxy in enumerate([p for p in (warp.proxy(),) if p] + [None]):
+            try:
+                return _download(url, out, proxy, quality)
+            except DownloadError as e:
+                if not e.retry:
+                    raise
+                error = e
+                log.info("youtube route %d failed (%s), trying the next one", i + 1, e)
+        if error is not None and getattr(error, "blocked", False):
+            _blocked_until = time.time() + BLOCK_PAUSE
+            log.info("youtube refuses this server, using third-party services for an hour")
+
+    # 2. Invidious: точные качества и размеры, работает и на длинных роликах.
+    if video_id:
         try:
-            return _download(url, out, proxy)
+            return _via_invidious(video_id, out, quality)
         except DownloadError as e:
             if not e.retry:
                 raise
-            error = e
-            log.info("youtube route %d failed (%s), trying the next one", i + 1, e)
+            error = error or e
+            log.info("youtube via invidious failed: %s", e)
+
+    # 3. cobalt. У вертикальных Shorts он меряет качество по длинной стороне.
     try:
-        # У вертикальных Shorts cobalt меряет качество по длинной стороне.
-        qualities = ("1080", "720", "480") if "/shorts/" in url else ("720", "480", "360")
+        if quality:
+            qualities: tuple[str, ...] = (str(quality),)
+        else:
+            qualities = ("1080", "720", "480") if "/shorts/" in url else ("720", "480", "360")
         files, title = cobalt.fetch(url, out, qualities)
-        return Media(files=files[:1], caption=title, **_probe(files[0]))
+        return Media(files=files[:1], caption=title, video_id=video_id, **_probe(files[0]))
     except DownloadError as e:
         log.info("youtube via cobalt failed: %s", e)
+
+    # 4. Свой прокси.
     if PROXY_URL:
-        return _download(url, out, PROXY_URL)
-    raise error
+        return _download(url, out, PROXY_URL, quality)
+    raise error or DownloadError("не получилось скачать ни одним способом, попробуй позже")
 
 
-def _download(url: str, out: Path, proxy: str | None) -> Media:
+def _via_invidious(video_id: str, out: Path, quality: int | None) -> Media:
+    data = invidious.info(video_id)
+    choices, menu = _plan(data["picks"], data["duration"], quality)
+    for choice in choices:
+        log.info("youtube %s: %dp via invidious %s", video_id, choice["quality"], data["host"])
+        try:
+            path = invidious.download(choice, out)
+        except TooBig:
+            continue  # оценка размера подвела — берём качество пониже
+        return Media(
+            files=[path],
+            caption=data["title"],
+            width=choice["width"],
+            height=choice["height"],
+            duration=data["duration"] or None,
+            video_id=video_id,
+            quality=choice["quality"],
+            qualities=menu,
+        )
+    raise DownloadError("видео не влезает в лимит Telegram — 50 МБ")
+
+
+def _download(url: str, out: Path, proxy: str | None, quality: int | None = None) -> Media:
     try:
         with yt_dlp.YoutubeDL(_opts(out, QUALITIES[0], False, proxy)) as ydl:
             info = ydl.sanitize_info(ydl.extract_info(url, download=False) or {})
@@ -176,8 +248,9 @@ def _download(url: str, out: Path, proxy: str | None) -> Media:
         if info.get("is_live"):
             raise DownloadError("это прямой эфир, его скачать нельзя")
 
+        choices, menu = _plan(_picks(info), int(info.get("duration") or 0), quality)
         # Размер до скачивания — оценка; если не угадали, берём качество пониже.
-        for choice in _choices(info):
+        for choice in choices:
             for old in out.iterdir():
                 old.unlink()
             log.info(
@@ -196,6 +269,9 @@ def _download(url: str, out: Path, proxy: str | None) -> Media:
                     width=choice["width"] or None,
                     height=choice["height"] or None,
                     duration=int(info.get("duration") or 0) or None,
+                    video_id=info.get("id"),
+                    quality=choice["quality"],
+                    qualities=menu,
                 )
         raise DownloadError("видео не влезает в лимит Telegram — 50 МБ")
     except DownloadError:
@@ -205,4 +281,5 @@ def _download(url: str, out: Path, proxy: str | None) -> Media:
         # другой маршрут; наши собственные отказы от маршрута не зависят.
         error = DownloadError(_explain(e))
         error.retry = True
+        error.blocked = "confirm you" in str(e) and "not a bot" in str(e)
         raise error from None

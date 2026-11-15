@@ -278,7 +278,7 @@ def _find_key(node: object, key: str):
             yield from _find_key(v, key)
 
 
-def _youtube_post(url: str, out: Path) -> Media:
+def _youtube_post(url: str, out: Path, quality: int | None = None) -> Media:
     """Посты из вкладки «Сообщество»: yt-dlp и gallery-dl их не умеют,
     поэтому достаём картинки прямо из данных страницы."""
     page, _ = _fetch(url.replace("//m.youtube.com", "//www.youtube.com"))
@@ -290,7 +290,7 @@ def _youtube_post(url: str, out: Path) -> Media:
 
     video_id = next(_find_key(attachment, "videoId"), None)
     if video_id:
-        return youtube.download(f"https://www.youtube.com/watch?v={video_id}", out)
+        return youtube.download(f"https://www.youtube.com/watch?v={video_id}", out, quality)
 
     images = list(_find_key(attachment, "backstageImageRenderer"))[:MAX_ITEMS]
     if not images:
@@ -304,9 +304,11 @@ def _youtube_post(url: str, out: Path) -> Media:
     return Media(_files(out))
 
 
-def _youtube(url: str, out: Path) -> Media:
+def _youtube(url: str, out: Path, quality: int | None = None) -> Media:
     try:
-        return _youtube_post(url, out) if YT_POST_RE.search(url) else youtube.download(url, out)
+        if YT_POST_RE.search(url):
+            return _youtube_post(url, out, quality)
+        return youtube.download(url, out, quality)
     except DownloadError:
         raise
     except Exception as e:  # noqa: BLE001
@@ -316,9 +318,9 @@ def _youtube(url: str, out: Path) -> Media:
 # ------------------------------------------------------------------ вход
 
 
-def _download_sync(url: str, out: Path) -> Media:
+def _download_sync(url: str, out: Path, quality: int | None = None) -> Media:
     if YT_RE.match(url):
-        return _youtube(url, out)
+        return _youtube(url, out, quality)
 
     is_tiktok = bool(TIKTOK_RE.match(url))
     if is_tiktok:
@@ -366,5 +368,6 @@ def _download_sync(url: str, out: Path) -> Media:
     raise DownloadError(text)
 
 
-async def download(url: str, out: Path) -> Media:
-    return await asyncio.to_thread(_download_sync, url, out)
+async def download(url: str, out: Path, quality: int | None = None) -> Media:
+    """quality — качество YouTube-видео, выбранное кнопкой; для остальных сайтов не нужно."""
+    return await asyncio.to_thread(_download_sync, url, out, quality)
