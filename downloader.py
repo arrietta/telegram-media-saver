@@ -18,6 +18,7 @@ from pathlib import Path
 
 import yt_dlp
 
+import cobalt
 import warp
 import youtube
 from common import (
@@ -73,8 +74,8 @@ def _clean(error: object) -> str:
     text = ANSI_RE.sub("", str(error)).replace("ERROR: ", "").strip()
     if "[Instagram]" in text and "empty media response" in text:
         return (
-            "этот пост Instagram показывает только тем, кто вошёл в аккаунт. Чтобы бот мог "
-            "такие качать, владельцу нужно добавить на хостинг cookies.txt с входом в Instagram."
+            "Instagram показывает этот пост только вошедшим в аккаунт — так бывает у закрытых "
+            "профилей и постов с ограничением по возрасту. Такие бот скачать не может."
         )
     if "[Instagram]" in text and ("rate-limit" in text or "Failed to parse JSON" in text):
         return "Instagram временно не отвечает серверу — слишком много запросов без входа. Попробуй через несколько минут."
@@ -226,6 +227,10 @@ def _tikwm(url: str, out: Path) -> None:
     _save(full(video), out / f"01_{data.get('id', 'tiktok')}.mp4")
 
 
+def _cobalt(url: str, out: Path) -> None:
+    cobalt.fetch(url, out)
+
+
 # ------------------------------------------------------------- Instagram
 
 
@@ -332,6 +337,8 @@ def _download_sync(url: str, out: Path) -> Media:
         steps = [_instagram_public]
     elif is_instagram:
         steps.append(_instagram_public)
+    # Последний шанс для всех сайтов — сторонний сервис cobalt (см. cobalt.py).
+    steps.append(_cobalt)
     errors: list[str] = []
     for step in steps:
         _clear(out)
@@ -357,9 +364,6 @@ def _download_sync(url: str, out: Path) -> Media:
             "это история (Story) TikTok — их видно только в приложении после входа "
             "в аккаунт, по ссылке они не скачиваются. Обычные видео и фото-посты работают."
         )
-    if is_instagram and not COOKIES:
-        if "cookies.txt" not in text:
-            text = f"{text} С файлом cookies.txt на хостинге Instagram работает надёжнее."
     raise DownloadError(text)
 
 

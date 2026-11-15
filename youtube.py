@@ -6,16 +6,20 @@
 
 На хостинге YouTube не пускает адрес сервера («Sign in to confirm you're not
 a bot»), поэтому сначала идём через Cloudflare WARP (см. warp.py), а если он
-не поднялся или не помог — напрямую, с файлом cookies.txt, если он есть.
+не поднялся или не помог — напрямую, а затем через сторонний сервис cobalt
+(см. cobalt.py), которому вход в аккаунт не нужен.
 """
 
 import copy
+import json
 import logging
 import re
+import subprocess
 from pathlib import Path
 
 import yt_dlp
 
+import cobalt
 import warp
 from common import (
     COOKIES,
@@ -24,7 +28,6 @@ from common import (
     PROXY_URL,
     DownloadError,
     Media,
-    has_cookies_for,
 )
 
 log = logging.getLogger("youtube")
@@ -72,13 +75,8 @@ def _explain(error: object) -> str:
     text = ANSI_RE.sub("", str(error)).replace("ERROR: ", "").strip()
     if "confirm you" in text and "not a bot" in text:
         # Проверено на Render: YouTube отказывает и напрямую, и через WARP, с любым
-        # «клиентом» yt-dlp. Бесплатно помогает только вход в аккаунт (cookies).
-        return "YouTube не пускает сервер без входа в аккаунт — " + (
-            "cookies.txt с входом в YouTube не помог (возможно, устарел); "
-            "помогает платный прокси (переменная PROXY_URL, см. README)"
-            if has_cookies_for("youtube.com")
-            else "владельцу нужно добавить в cookies.txt на хостинге вход в YouTube (см. README)"
-        )
+        # «клиентом» yt-dlp — поэтому дальше идём в сторонний сервис (cobalt.py).
+        return "YouTube не отдаёт видео серверу, а запасной сервис сейчас не справился. Попробуй позже."
     return text[:300] or "неизвестная ошибка"
 
 
@@ -125,18 +123,48 @@ def _choices(info: dict) -> list[dict]:
     return fitting
 
 
+def _probe(path: Path) -> dict:
+    """Размеры кадра и длительность готового файла — с ними Telegram сразу рисует
+    превью нужной формы. Без ffprobe или при сбое просто обходимся без них."""
+    try:
+        raw = subprocess.run(
+            ["ffprobe", "-v", "error", "-select_streams", "v:0", "-show_entries",
+             "stream=width,height:format=duration", "-of", "json", str(path)],
+            capture_output=True, text=True, timeout=20, check=True,
+        ).stdout
+        data = json.loads(raw)
+        stream = (data.get("streams") or [{}])[0]
+        return {
+            "width": stream.get("width") or None,
+            "height": stream.get("height") or None,
+            "duration": int(float(data.get("format", {}).get("duration") or 0)) or None,
+        }
+    except Exception:  # noqa: BLE001
+        return {}
+
+
 def download(url: str, out: Path) -> Media:
-    # Маршруты от бесплатного к платному: WARP, напрямую (с cookies), свой прокси.
-    # Ошибку показываем от последней попытки.
-    routes = [p for p in (warp.proxy(),) if p] + [None] + [p for p in (PROXY_URL,) if p]
-    for i, proxy in enumerate(routes):
+    # Маршруты от бесплатного к платному: WARP, напрямую, сторонний сервис cobalt,
+    # свой прокси. Если не вышло нигде, показываем отказ самого YouTube.
+    error: DownloadError | None = None
+    for i, proxy in enumerate([p for p in (warp.proxy(),) if p] + [None]):
         try:
             return _download(url, out, proxy)
         except DownloadError as e:
-            if i == len(routes) - 1 or not e.retry:
+            if not e.retry:
                 raise
+            error = e
             log.info("youtube route %d failed (%s), trying the next one", i + 1, e)
-    raise AssertionError("unreachable")
+    try:
+        # У вертикальных Shorts cobalt меряет качество по длинной стороне.
+        qualities = ("1080", "720", "480") if "/shorts/" in url else ("720", "480", "360")
+        files, title = cobalt.fetch(url, out, qualities)
+        return Media(files=files[:1], caption=title, **_probe(files[0]))
+    except DownloadError as e:
+        log.info("youtube via cobalt failed: %s", e)
+    if PROXY_URL:
+        return _download(url, out, PROXY_URL)
+    raise error
 
 
 def _download(url: str, out: Path, proxy: str | None) -> Media:
