@@ -12,6 +12,7 @@ import os
 import re
 import shutil
 import tempfile
+import threading
 from pathlib import Path
 
 from aiogram import Bot, Dispatcher, F
@@ -32,6 +33,7 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
+import instagram  # noqa: E402
 import warp  # noqa: E402
 from common import MAX_BYTES, DownloadError, Media  # noqa: E402 — после load_dotenv,
 from downloader import (  # noqa: E402 — чтобы модули увидели переменные из .env
@@ -254,6 +256,10 @@ def main() -> None:
     if not BOT_TOKEN:
         raise SystemExit("Не задан BOT_TOKEN (см. .env.example)")
     warp.start_in_background()
+    # Только статус (ok / expired / none…) — значения cookies в лог не пишем.
+    threading.Thread(
+        target=lambda: log.info("instagram login: %s", instagram.check()), daemon=True
+    ).start()
     bot = Bot(BOT_TOKEN)
     if WEBHOOK_BASE:
         run_webhook(bot)

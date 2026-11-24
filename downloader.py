@@ -19,6 +19,7 @@ from pathlib import Path
 import yt_dlp
 
 import cobalt
+import instagram
 import warp
 import youtube
 from common import (
@@ -332,12 +333,10 @@ def _download_sync(url: str, out: Path, quality: int | None = None) -> Media:
     if is_tiktok:
         steps.append(_tikwm)
     is_instagram = "instagram.com" in url.lower()
-    if is_instagram and not COOKIES:
-        # Без входа gallery-dl с Instagram не работает вообще, а анонимных запросов
-        # Instagram даёт мало — поэтому один шаг, который берёт и видео, и фото.
-        steps = [_instagram_public]
-    elif is_instagram:
-        steps.append(_instagram_public)
+    if is_instagram:
+        # Сначала без входа — так аккаунт из cookies.txt не светится на каждой ссылке.
+        # Вход нужен постам, которые гостю не показывают (профили 18+, закрытые).
+        steps = [_instagram_public, instagram.fetch]
     # Последний шанс для всех сайтов — сторонний сервис cobalt (см. cobalt.py).
     steps.append(_cobalt)
     errors: list[str] = []
@@ -357,8 +356,14 @@ def _download_sync(url: str, out: Path, quality: int | None = None) -> Media:
                 continue
         if files:
             return Media(files)
-    # Показываем ошибку yt-dlp — она обычно самая понятная.
-    main = errors[steps.index(_ytdlp)] if _ytdlp in steps and len(errors) == len(steps) else None
+    # Показываем самую понятную ошибку: у Instagram — от попытки со входом
+    # (она точно говорит, в чём дело), у остальных — от yt-dlp.
+    main = None
+    if len(errors) == len(steps):
+        for best in (instagram.fetch, _ytdlp):
+            if best in steps:
+                main = errors[steps.index(best)]
+                break
     text = main or (errors[0] if errors else "по ссылке не нашлось медиа")
     if is_tiktok and TIKTOK_STORY_RE.search(url):
         text = (
