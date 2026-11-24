@@ -20,6 +20,7 @@ import yt_dlp
 
 import cobalt
 import instagram
+import rapidapi
 import warp
 import youtube
 from common import (
@@ -334,9 +335,14 @@ def _download_sync(url: str, out: Path, quality: int | None = None) -> Media:
         steps.append(_tikwm)
     is_instagram = "instagram.com" in url.lower()
     if is_instagram:
-        # Сначала без входа — так аккаунт из cookies.txt не светится на каждой ссылке.
-        # Вход нужен постам, которые гостю не показывают (профили 18+, закрытые).
-        steps = [_instagram_public, instagram.fetch]
+        # Сначала без входа. Посты, которые гостю не показывают (профили 18+),
+        # берём через сторонний сервис со своими аккаунтами (rapidapi.py), а если
+        # он не настроен — со входом из cookies.txt, если вход там есть.
+        steps = [_instagram_public]
+        if rapidapi.enabled():
+            steps.append(rapidapi.fetch)
+        if instagram.has_session():
+            steps.append(instagram.fetch)
     # Последний шанс для всех сайтов — сторонний сервис cobalt (см. cobalt.py).
     steps.append(_cobalt)
     errors: list[str] = []
@@ -360,7 +366,7 @@ def _download_sync(url: str, out: Path, quality: int | None = None) -> Media:
     # (она точно говорит, в чём дело), у остальных — от yt-dlp.
     main = None
     if len(errors) == len(steps):
-        for best in (instagram.fetch, _ytdlp):
+        for best in (rapidapi.fetch, instagram.fetch, _ytdlp):
             if best in steps:
                 main = errors[steps.index(best)]
                 break

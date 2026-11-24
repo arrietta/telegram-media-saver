@@ -34,6 +34,7 @@ from dotenv import load_dotenv
 load_dotenv()
 
 import instagram  # noqa: E402
+import rapidapi  # noqa: E402
 import warp  # noqa: E402
 from common import MAX_BYTES, DownloadError, Media  # noqa: E402 — после load_dotenv,
 from downloader import (  # noqa: E402 — чтобы модули увидели переменные из .env
@@ -258,7 +259,12 @@ def main() -> None:
     warp.start_in_background()
     # Только статус (ok / expired / none…) — значения cookies в лог не пишем.
     threading.Thread(
-        target=lambda: log.info("instagram login: %s", instagram.check()), daemon=True
+        target=lambda: log.info(
+            "instagram login: %s, rapidapi: %s",
+            instagram.check(),
+            "on" if rapidapi.enabled() else "off",
+        ),
+        daemon=True,
     ).start()
     bot = Bot(BOT_TOKEN)
     if WEBHOOK_BASE:

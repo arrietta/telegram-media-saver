@@ -56,10 +56,12 @@ cp .env.example .env   # впиши BOT_TOKEN
   Серверы бот находит сам (api.invidious.io, cobalt.directory); свои можно задать переменными
   `INVIDIOUS_API` и `COBALT_API`. Их держат добровольцы: они могут пропадать, и ссылки, которые
   ты кидаешь боту, им видны.
-- **Посты Instagram из профилей 18+ и закрытых** гостю не показывают. Их бот качает со входом
-  в аккаунт из `cookies.txt` на хостинге (Secret File в Render), и только когда без входа не вышло.
-  При запуске в логе есть строка `instagram login: ok` — значит вход жив; `expired` — cookies
-  устарели, их нужно экспортировать заново. Аккаунту нужен подтверждённый возраст 18+.
+- **Посты Instagram из профилей 18+** гостю не показывают. Их бот берёт через сторонний сервис
+  [«Download All in One!»](https://rapidapi.com/coder2077/api/instagram-downloader-download-instagram-videos-stories1)
+  на RapidAPI — у него свои аккаунты, поэтому ни вход, ни cookies не нужны. Нужен ключ RapidAPI
+  в переменной `RAPIDAPI_KEY` и бесплатный план Basic: ~500 ссылок в месяц. Сервис зовётся, только
+  когда без него не вышло. Если ключа нет, а в `cookies.txt` есть живой вход в Instagram, бот
+  использует его. При запуске в логе строка `instagram login: …, rapidapi: on|off`.
 - **YouTube через Cloudflare WARP (эксперимент).** При запуске бот пробует поднять бесплатный
   туннель WARP (`warp.py`) и ходит на YouTube через него — с адреса Cloudflare, а не хостинга.
   В логах при старте будет строка `WARP is ready` или `WARP is off: причина`. Если туннель
